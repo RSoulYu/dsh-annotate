@@ -26,7 +26,7 @@
  * @module dsh-annotate
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -42,7 +42,7 @@ export const inject = ['tools']
  * re-activated; the tool reports this value so "which revision is live" is
  * answerable without a restart-and-guess.
  */
-const REVISION = 2
+const REVISION = 3
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
 const STORE_VERSION = 1
@@ -113,6 +113,33 @@ function normalizeRecord(raw) {
   }
 }
 
+/**
+ * Replace a file with `text`, atomically where the platform allows it.
+ *
+ * The temp-file + rename dance is what keeps a crash from leaving a half
+ * written store; the fallback covers platforms (notably Windows) where
+ * `rename` refuses to replace an existing destination instead of doing it
+ * atomically.
+ *
+ * @param file destination path.
+ * @param text full next content.
+ */
+async function writeAtomic(file, text) {
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
+  await writeFile(tmp, text, { encoding: 'utf8', mode: 0o600 })
+  try {
+    await rename(tmp, file)
+  } catch (error) {
+    if (error?.code === 'EEXIST' || error?.code === 'EPERM' || error?.code === 'EACCES') {
+      await rm(file, { force: true })
+      await rename(tmp, file)
+      return
+    }
+    await rm(tmp, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
 /* --------------------------------------------------------------- the store */
 
 class AnnotationStore {
@@ -156,9 +183,7 @@ class AnnotationStore {
     const snapshot = JSON.stringify({ version: STORE_VERSION, annotations: this.state.annotations }, null, 2)
     this.writing = this.writing.then(async () => {
       await mkdir(dirname(this.file), { recursive: true })
-      const tmp = `${this.file}.tmp-${process.pid}-${Date.now()}`
-      await writeFile(tmp, snapshot, { encoding: 'utf8', mode: 0o600 })
-      await rename(tmp, this.file)
+      await writeAtomic(this.file, snapshot)
     })
     return this.writing
   }
@@ -335,9 +360,34 @@ function injectIntoMessages(messages, block) {
 /* -------------------------------------------------------------- http plumbing */
 
 function hostIsLocal(request) {
-  const host = String(request.headers?.host ?? '')
+  const host = String(request?.headers?.host ?? '')
   const name = host.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase()
   return name === '127.0.0.1' || name === 'localhost' || name === '::1'
+}
+
+/**
+ * Whether one browser request may use the annotation API.
+ *
+ * Two fences, both required: the `Host` header must be loopback (so a remote
+ * page cannot reach this route by DNS rebinding), and the request must prove it
+ * came from a page THIS process served — with the per-boot token published into
+ * that page's boot payload, or, before any page has been rendered, with the
+ * static marker header the browser half always sends.
+ *
+ * Exported so the guard can be tested without a live server.
+ *
+ * @param request incoming request; only `headers` is read.
+ * @param token the per-boot token, or an empty string when none was minted.
+ * @param requireToken true once that token has been published into a served page.
+ * @returns whether the request is authorized.
+ */
+export function authorize(request, token, requireToken) {
+  if (!hostIsLocal(request)) return false
+  const headers = request?.headers ?? {}
+  if (requireToken === true && typeof token === 'string' && token.length > 0) {
+    return headers['x-dsh-annotate-token'] === token
+  }
+  return headers['x-dsh-annotation'] === '1'
 }
 
 async function readJsonBody(request) {
@@ -386,6 +436,21 @@ function toClient(record, numbers) {
 export function apply(ctx) {
   const store = new AnnotationStore(storePath())
   const logger = ctx.logger ?? console
+  /** Per-boot secret: only a page this process served can present it. */
+  const token = randomUUID()
+  let tokenPublished = false
+
+  // Hand the token to the served page. `index-inject` runs while the boot HTML
+  // is rendered, which always precedes the browser half that reads it, so the
+  // flag is set before any authorized request can arrive from that page.
+  ctx.on('webserver/index-inject', (table) => {
+    tokenPublished = true
+    table.push({
+      kind: 'global',
+      name: '__DSH_ANNOTATE__',
+      value: { route: ROUTE_PATH, token },
+    })
+  })
 
   /* ---- browser API route (client half) ---- */
   ctx.inject(['webServer'], (webCtx) => {
@@ -400,7 +465,7 @@ export function apply(ctx) {
             // Local-only plugin surface, guarded by a custom header: a
             // cross-origin page cannot set it without a preflight, and this
             // route answers no preflight.
-            if (!hostIsLocal(request) || request.headers['x-dsh-annotation'] !== '1') {
+            if (!authorize(request, token, tokenPublished)) {
               sendJson(response, 403, { ok: false, error: 'forbidden' })
               return
             }

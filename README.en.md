@@ -83,6 +83,10 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 - **Persistent and reviewable.** Annotations survive the send, the session and a
   restart; the agent can re-read them on demand.
 - **Zero footprint when unused.** No annotations, no UI.
+- **Survives a reload.** Quotes are re-located through a whitespace-normalized
+  index, across node boundaries, in one pass over the document.
+- **Fenced API.** Loopback `Host` plus a per-boot token that only the pages this
+  process served ever see.
 
 ## Limitations
 
@@ -90,18 +94,21 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
    forking a reply will not re-deliver it (use the `annotation` tool), and the
    transcript keeps no record of what you annotated.
 2. **Host-half edits need a restart** (see above).
-3. **Re-anchoring after a reload is text-based.** Badges and highlights rely on a
-   live `Range`; after a refresh the quote is matched by text, so a selection
-   spanning several text nodes may not relocate (the panel always keeps the full
-   quote).
+3. **Re-anchoring after a reload is quote-based.** Badges and highlights rely on
+   a live `Range`; after a refresh the quote is relocated through a
+   whitespace-normalized full-text index, so selections spanning several text
+   nodes and whitespace differences both work. A quote that is no longer in the
+   document at all (for example a message virtualized out of the transcript)
+   still cannot be located — the panel always keeps the full quote.
 4. **Web only.** There is no TUI build.
 5. **Text only.** Text inside images or inside structured tool-call cards cannot
    be selected.
 6. **Numbering is per session.**
-7. **The local HTTP route is not strongly authenticated.** It binds to loopback
-   and requires a custom header (which a cross-origin page cannot send without a
-   preflight); another local process could still call it. It only reads and
-   writes annotation data.
+7. **The local HTTP route is fenced, not private.** Two gates: the `Host` must be
+   loopback (DNS rebinding), and the request must carry a per-boot token that is
+   written only into the boot payload of pages this process served. A local
+   process running as the same user can still read
+   `~/.dsh/annotations/annotations.json` directly (mode `0600`).
 8. **Plaintext storage** (`0600`). Sensitive text pasted into a note stays in
    `~/.dsh/annotations/` until you delete it.
 9. **Verified on Linux only.** The code uses `node:*` builtins and browser APIs,
@@ -111,8 +118,12 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 ```sh
 node --check index.js && node --check client.js
-node --test test/
+node --test test/          # 23 tests: delivery, authorization, anchoring
 ```
+
+The anchoring tests exercise the shipped code: the core is marked `@pure-anchor`
+inside `client.js` and the test evaluates that exact slice, so there is no second
+copy of the algorithm to drift.
 
 The host half imports only `node:*` builtins — a workspace-installed bundle
 cannot resolve `@deepseek-ai/*` packages at runtime. The browser half only

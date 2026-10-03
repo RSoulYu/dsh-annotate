@@ -175,11 +175,28 @@ window.__ModuleLoader__.load({
 
     /* -------------------------------------------------------------- api */
 
+    /** Boot payload the host half injects into the served page. */
+    function bootConfig() {
+      var config = window.__DSH_ANNOTATE__
+      return config !== null && typeof config === 'object' ? config : null
+    }
+
+    function apiHeaders() {
+      // The static marker is the compatibility fence (an older host half only
+      // knows it); the per-boot token is what a current host half requires.
+      var headers = { 'content-type': 'application/json', 'x-dsh-annotation': '1' }
+      var config = bootConfig()
+      if (config !== null && typeof config.token === 'string' && config.token.length > 0) {
+        headers['x-dsh-annotate-token'] = config.token
+      }
+      return headers
+    }
+
     function api(payload) {
       return fetch(API, {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'content-type': 'application/json', 'x-dsh-annotation': '1' },
+        headers: apiHeaders(),
         body: JSON.stringify(payload),
       })
         .then(function (response) {
@@ -340,57 +357,153 @@ window.__ModuleLoader__.load({
     }
 
     /** Find the nth occurrence of a quote inside one text node (best effort). */
-    function findQuoteRange(quote, wanted) {
-      if (typeof quote !== 'string' || quote.length === 0) return null
-      var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null)
-      var seen = 0
-      var node = walker.nextNode()
-      while (node !== null) {
-        var element = node.parentElement
-        if (closestOf(element, '[data-dsa-ui]') === null) {
-          var text = node.nodeValue || ''
-          var from = 0
-          for (;;) {
-            var at = text.indexOf(quote, from)
-            if (at === -1) break
-            if (seen === wanted) {
-              var range = document.createRange()
-              range.setStart(node, at)
-              range.setEnd(node, at + quote.length)
-              return range
-            }
-            seen += 1
-            from = at + 1
-          }
-        }
-        node = walker.nextNode()
-      }
-      return null
+    /* @pure-anchor
+     *
+     * Quote anchoring core. Kept free of any DOM reference so it can be
+     * exercised directly by the test suite: the browser side only builds the
+     * segment list and turns the returned offsets back into a Range.
+     */
+
+    /** Collapse every whitespace run to one space and trim, like the browser does when it copies a selection. */
+    function normalizeQuote(text) {
+      return String(text == null ? '' : text).replace(/\s+/g, ' ').trim()
     }
 
     /**
-     * Rebuild ranges that were lost (page reload): group equal quotes in
-     * creation order and map each annotation onto one occurrence.
+     * Build a whitespace-normalized haystack over ordered text segments.
+     *
+     * Every emitted character remembers which segment and offset it came from,
+     * so a match can be mapped back to the DOM. Injected separator spaces map to
+     * null: a quote never starts or ends on one, and a match that would is
+     * skipped rather than mapped to the wrong place.
+     *
+     * @param segments ordered `{ text }` segments in document order.
+     */
+    function buildAnchorIndex(segments) {
+      var text = ''
+      var map = []
+      var pendingSpace = false
+      var started = false
+      for (var s = 0; s < segments.length; s += 1) {
+        var segment = String((segments[s] && segments[s].text) || '')
+        for (var o = 0; o < segment.length; o += 1) {
+          if (/\s/.test(segment.charAt(o))) {
+            pendingSpace = started
+            continue
+          }
+          if (pendingSpace) {
+            text += ' '
+            map.push(null)
+            pendingSpace = false
+          }
+          text += segment.charAt(o)
+          map.push({ s: s, o: o })
+          started = true
+        }
+      }
+      return { text: text, map: map }
+    }
+
+    /**
+     * Locate the `wanted`-th (0-based) occurrence of a normalized quote.
+     *
+     * @param index result of {@link buildAnchorIndex}.
+     * @param quote already-normalized quote text.
+     * @param wanted occurrence ordinal among equal quotes.
+     * @returns `{ start, end }` segment/offset pairs, or null.
+     */
+    function locateQuote(index, quote, wanted) {
+      if (typeof quote !== 'string' || quote.length === 0) return null
+      var seen = 0
+      var from = 0
+      for (;;) {
+        var at = index.text.indexOf(quote, from)
+        if (at === -1) return null
+        var head = index.map[at]
+        var tail = index.map[at + quote.length - 1]
+        if (head != null && tail != null) {
+          if (seen === wanted) return { start: head, end: tail }
+          seen += 1
+        }
+        from = at + 1
+      }
+    }
+    /* @pure-anchor-end */
+
+    /** Ordered text segments of the transcript, skipping this plugin's own UI. */
+    function collectSegments() {
+      var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null)
+      var segments = []
+      var node = walker.nextNode()
+      while (node !== null) {
+        if (closestOf(node.parentElement, '[data-dsa-ui]') === null) {
+          segments.push({ node: node, text: node.nodeValue || '' })
+        }
+        node = walker.nextNode()
+      }
+      return segments
+    }
+
+    /** Turn one match back into a live Range, or null when the offsets are stale. */
+    function rangeOfMatch(segments, match) {
+      var head = segments[match.start.s]
+      var tail = segments[match.end.s]
+      if (head === undefined || tail === undefined) return null
+      var headLength = (head.node.nodeValue || '').length
+      var tailLength = (tail.node.nodeValue || '').length
+      var range = document.createRange()
+      try {
+        range.setStart(head.node, Math.min(match.start.o, headLength))
+        range.setEnd(tail.node, Math.min(match.end.o + 1, tailLength))
+      } catch (error) {
+        return null
+      }
+      return range
+    }
+
+    /**
+     * Find one quote in the transcript.
+     *
+     * Unlike a per-node `indexOf`, this matches across node boundaries (a quote
+     * that spans `<strong>` or a code span is the common case) and ignores
+     * whitespace differences between the copied selection and the rendered text.
+     */
+    function findQuoteRange(quote, wanted) {
+      var segments = collectSegments()
+      var match = locateQuote(buildAnchorIndex(segments), normalizeQuote(quote), wanted)
+      return match === null ? null : rangeOfMatch(segments, match)
+    }
+
+    /**
+     * Rebuild ranges that were lost (page reload).
+     *
+     * One index build serves every missing annotation (the old shape walked the
+     * whole document once per annotation, which is quadratic on a long
+     * transcript), and equal quotes are spread over their occurrences in
+     * creation order so two annotations of the same sentence stay distinct.
      */
     function reanchor() {
-      var byQuote = Object.create(null)
-      var missing = []
-      store.annotations
+      var missing = store.annotations
         .slice()
         .sort(function (a, b) {
           return a.createdAt - b.createdAt
         })
-        .forEach(function (item) {
-          if (store.ranges[item.id] !== undefined && store.ranges[item.id].startContainer.isConnected === true) return
-          var key = item.quote
-          if (byQuote[key] === undefined) byQuote[key] = 0
-          var index = byQuote[key]
-          byQuote[key] = index + 1
-          missing.push([item, index])
+        .filter(function (item) {
+          var range = store.ranges[item.id]
+          return range === undefined || range.startContainer.isConnected !== true
         })
-      missing.slice(0, 120).forEach(function (pair) {
-        var range = findQuoteRange(pair[0].quote, pair[1])
-        if (range !== null) store.ranges[pair[0].id] = range
+      if (missing.length === 0) return
+      var segments = collectSegments()
+      var index = buildAnchorIndex(segments)
+      var used = Object.create(null)
+      missing.slice(0, 200).forEach(function (item) {
+        var key = normalizeQuote(item.quote)
+        var occurrence = used[key] === undefined ? 0 : used[key]
+        var match = locateQuote(index, key, occurrence)
+        if (match === null) return
+        used[key] = occurrence + 1
+        var range = rangeOfMatch(segments, match)
+        if (range !== null) store.ranges[item.id] = range
       })
     }
 
@@ -1406,6 +1519,12 @@ window.__ModuleLoader__.load({
         var mouseDown = function (event) {
           onDocumentMouseDown(event)
         }
+        var keyDown = function (event) {
+          if (event.key === 'Escape' && store.popover !== null) {
+            store.popover = null
+            emit()
+          }
+        }
         var viewport = function () {
           onViewportChange()
         }
@@ -1415,6 +1534,7 @@ window.__ModuleLoader__.load({
         document.addEventListener('mouseup', settle, true)
         document.addEventListener('keyup', settle, true)
         document.addEventListener('mousedown', mouseDown, true)
+        document.addEventListener('keydown', keyDown, true)
         window.addEventListener('scroll', viewport, true)
         window.addEventListener('resize', viewport)
         window.addEventListener('focus', visibility)
@@ -1423,6 +1543,7 @@ window.__ModuleLoader__.load({
           document.removeEventListener('mouseup', settle, true)
           document.removeEventListener('keyup', settle, true)
           document.removeEventListener('mousedown', mouseDown, true)
+          document.removeEventListener('keydown', keyDown, true)
           window.removeEventListener('scroll', viewport, true)
           window.removeEventListener('resize', viewport)
           window.removeEventListener('focus', visibility)

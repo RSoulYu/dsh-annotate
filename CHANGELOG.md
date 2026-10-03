@@ -4,6 +4,43 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-03
+
+### Added
+
+- **Per-boot API token.** The host mints one random token per process and
+  publishes it into the boot payload of every page it serves
+  (`webserver/index-inject` → `__DSH_ANNOTATE__`); the browser half presents it
+  on every request. A request is now accepted only when the `Host` is loopback
+  **and** the token matches, so neither a cross-origin page nor a DNS-rebinding
+  trick can reach the route. Before the first page is served the host falls back
+  to the static marker header, which keeps a fresh install working while the
+  browser half catches up.
+- **Cross-node quote re-anchoring.** Quotes now resolve through a
+  whitespace-normalized full-text index instead of a per-text-node `indexOf`, so
+  a selection that spans `<strong>`, a code span or any other element boundary
+  is found again after a reload, and indentation differences between the DOM and
+  the copied text no longer break the match.
+- **`Escape` closes the badge popover.**
+- Tests for the anchoring core (`test/anchor.test.mjs`) and the authorization
+  fence (`test/authorize.test.mjs`); the suite grew from 7 to 23.
+
+### Changed
+
+- **Re-anchoring is now one pass over the document.** The previous shape walked
+  every text node once *per* annotation, which is quadratic on a long transcript;
+  the index is built once and every missing quote is located against it.
+- **Atomic writes survive platforms where `rename` will not replace a file.**
+  The store write falls back to remove-then-rename on `EEXIST`/`EPERM`/`EACCES`
+  instead of failing the save.
+
+### Fixed
+
+- `hostIsLocal()` is total: a request object without `headers` is refused rather
+  than throwing inside the guard (found by the new authorization tests).
+
+[0.2.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.1.0...v0.2.0
+
 ## [0.1.0] - 2026-10-03
 
 First release. Verified against DSH `0.2.0-rc.2` on the Web profile.
