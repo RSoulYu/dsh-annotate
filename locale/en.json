@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Annotation Lite",
+    "description": "Select text in the transcript and annotate it; the host delivers the annotation block with the next message you send, and the reply answers it by number. Stored under ~/.dsh/annotations, kept across sessions, reviewable below the composer."
+  }
+}

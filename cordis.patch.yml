@@ -1,0 +1,6 @@
+# dsh-annotate bundle: one Host row (storage, delivery, tool).
+# The browser half is declared by `dsh.client` in package.json and injected by
+# the client-modules service, so this patch inserts the Host row only.
+- insert:
+    - id: dsh-annotate
+      name: 'dsh-annotate'
