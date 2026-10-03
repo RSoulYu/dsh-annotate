@@ -90,11 +90,19 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 ## Limitations
 
-1. **The block is model-side context, not a session-log event.** Regenerating or
-   forking a reply will not re-deliver it (use the `annotation` tool), and the
-   transcript keeps no record of what you annotated.
+1. **The block is model-side context, not a session-log event — deliberately, and
+   it is not what makes annotations persistent.** The annotations themselves live
+   in `$DSH_HOME/annotations/annotations.json`, so restarting DSH and reopening
+   the session restores the chip, the sidebar list and every status; highlights
+   and badges re-locate by quote (and appear as the quoted message renders).
+   Writing the block into the log would (a) put visible content in the transcript
+   — the one thing this plugin avoids — and (b) require an event type DSH accepts,
+   since a live `Session.append()` cannot set the `ignorable: true` envelope that
+   unknown stored events need, and a session holding one refuses to reopen.
 2. **Host-half edits need a restart** (see above).
-3. **Re-anchoring after a reload is quote-based.** Badges and highlights rely on
+3. **Re-anchoring after a reload is quote-based, and now lazy:** a quote whose
+   message is not loaded yet is marked “source not in view” in the panel and is
+   located automatically once that message renders. The rest still applies. Badges and highlights rely on
    a live `Range`; after a refresh the quote is relocated through a
    whitespace-normalized full-text index, so selections spanning several text
    nodes and whitespace differences both work. A quote that is no longer in the

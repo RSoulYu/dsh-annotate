@@ -36,6 +36,10 @@ window.__ModuleLoader__.load({
     var HIGHLIGHT_NAME = 'dsa-mark'
     var STYLE_ID = 'dsa-style'
     var POLL_MS = 2000
+    /** Quiet period before one re-anchoring pass after the transcript changes. */
+    var ANCHOR_DEBOUNCE_MS = 800
+    /** Floor between two re-anchoring passes, so a busy transcript cannot thrash it. */
+    var ANCHOR_RETRY_MS = 1500
     var TOOLBAR_W = 78
     var TOOLBAR_H = 30
     var EDITOR_W = 340
@@ -77,6 +81,8 @@ window.__ModuleLoader__.load({
       'panel.copy': '复制',
       'panel.copied': '已复制',
       'panel.hint': '批注会在你发送下一条消息时自动随消息发给我，我会按编号逐条回应。',
+      'panel.unanchored': '原文未在视图中',
+      'panel.unanchoredHint': '这句原文还没出现在当前加载的消息里。滚动到它所在的回复，高亮与编号徽标会自动出现。',
       'panel.error': '批注服务不可用：',
       'panel.loading': '加载中…',
       'toast.jumpFailed': '原文不在当前视图中',
@@ -112,6 +118,8 @@ window.__ModuleLoader__.load({
       'panel.copy': 'Copy',
       'panel.copied': 'Copied',
       'panel.hint': 'Annotations ride the next message you send; the reply answers them by number.',
+      'panel.unanchored': 'source not in view',
+      'panel.unanchoredHint': 'The quoted message is not loaded yet. Scroll to the reply it came from and the highlight and badge appear on their own.',
       'panel.error': 'Annotation service unavailable: ',
       'panel.loading': 'Loading…',
       'toast.jumpFailed': 'The source text is not in the current view',
@@ -483,6 +491,7 @@ window.__ModuleLoader__.load({
      * creation order so two annotations of the same sentence stay distinct.
      */
     function reanchor() {
+      var added = 0
       var missing = store.annotations
         .slice()
         .sort(function (a, b) {
@@ -492,7 +501,7 @@ window.__ModuleLoader__.load({
           var range = store.ranges[item.id]
           return range === undefined || range.startContainer.isConnected !== true
         })
-      if (missing.length === 0) return
+      if (missing.length === 0) return added
       var segments = collectSegments()
       var index = buildAnchorIndex(segments)
       var used = Object.create(null)
@@ -503,8 +512,67 @@ window.__ModuleLoader__.load({
         if (match === null) return
         used[key] = occurrence + 1
         var range = rangeOfMatch(segments, match)
-        if (range !== null) store.ranges[item.id] = range
+        if (range !== null) {
+          store.ranges[item.id] = range
+          added += 1
+        }
       })
+      return added
+    }
+
+    /** Whether this annotation currently has a live Range in the loaded transcript. */
+    function isAnchored(id) {
+      var range = store.ranges[id]
+      return range !== undefined && range.startContainer.isConnected === true
+    }
+
+    /**
+     * Whether any annotation still needs a range.
+     *
+     * This is the gate for every retry: a fully anchored session (the normal
+     * case) costs one array scan and nothing else.
+     */
+    function needsAnchoring() {
+      for (var i = 0; i < store.annotations.length; i += 1) {
+        if (!isAnchored(store.annotations[i].id)) return true
+      }
+      return false
+    }
+
+    var anchorRetryTimer = null
+    var lastAnchorPassAt = 0
+
+    /**
+     * Re-attempt localization after the transcript changes.
+     *
+     * A quote is only locatable while its message is rendered, and the
+     * transcript loads history in pages: after restarting DSH, an annotation on
+     * a message that is still above the loaded window has no range until that
+     * message appears. Retrying on DOM changes and on scroll is what makes those
+     * marks come back on their own instead of only after a manual refresh.
+     *
+     * Debounced (so streaming keeps postponing one single pass) and rate
+     * limited, and it stops by itself as soon as everything is anchored.
+     */
+    function scheduleAnchorRetry() {
+      if (anchorRetryTimer !== null) return
+      if (store.sessionId === null || !needsAnchoring()) return
+      anchorRetryTimer = setTimeout(function () {
+        anchorRetryTimer = null
+        var now = Date.now()
+        if (now - lastAnchorPassAt < ANCHOR_RETRY_MS) {
+          scheduleAnchorRetry()
+          return
+        }
+        lastAnchorPassAt = now
+        // Repaint only when something was actually located. An unconditional
+        // emit would mutate the DOM, re-arm the observer that scheduled this
+        // pass, and spin forever on a quote that is simply not loaded yet.
+        if (reanchor() > 0) {
+          syncHighlights()
+          emit()
+        }
+      }, ANCHOR_DEBOUNCE_MS)
     }
 
     function syncHighlights() {
@@ -775,6 +843,8 @@ window.__ModuleLoader__.load({
         // resizing would leave it pointing at nothing.
         store.popover = null
         emit()
+        // Scrolling can bring the annotated message into the DOM.
+        scheduleAnchorRetry()
       })
     }
 
@@ -1191,6 +1261,16 @@ window.__ModuleLoader__.load({
                 }).catch(function () {})
               }
             }),
+            isAnchored(annotation.id)
+              ? null
+              : h('span', {
+                  style: {
+                    color: 'var(--dsw-alias-label-secondary)',
+                    font: '11px/1.6 system-ui, sans-serif',
+                    whiteSpace: 'nowrap',
+                  },
+                  title: tr('panel.unanchoredHint'),
+                }, tr('panel.unanchored')),
             smallButton(tr('panel.jump'), guard('jump to source', function () { jumpTo(annotation) })),
             smallButton(tr('panel.edit'), function () {
               setDraft(annotation.note)
@@ -1531,6 +1611,15 @@ window.__ModuleLoader__.load({
         var visibility = function () {
           if (document.visibilityState === 'visible') refresh()
         }
+        // Older history and re-rendered messages arrive as DOM changes; watching
+        // them is what lets a stale annotation find its quote again.
+        var observer = null
+        if (typeof MutationObserver === 'function') {
+          observer = new MutationObserver(function () {
+            scheduleAnchorRetry()
+          })
+          observer.observe(document.body, { childList: true, subtree: true })
+        }
         document.addEventListener('mouseup', settle, true)
         document.addEventListener('keyup', settle, true)
         document.addEventListener('mousedown', mouseDown, true)
@@ -1551,6 +1640,11 @@ window.__ModuleLoader__.load({
           if (pollTimer !== null) {
             clearInterval(pollTimer)
             pollTimer = null
+          }
+          if (observer !== null) observer.disconnect()
+          if (anchorRetryTimer !== null) {
+            clearTimeout(anchorRetryTimer)
+            anchorRetryTimer = null
           }
           try {
             if (window.CSS && CSS.highlights) CSS.highlights.delete(HIGHLIGHT_NAME)

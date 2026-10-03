@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-03
+
+### Added
+
+- **Lazy re-anchoring.** A quote can only be located while its message is
+  rendered, and the transcript loads history in pages: after a restart, an
+  annotation on a message above the loaded window had no range until something
+  forced a refresh. The browser half now retries localization on DOM changes and
+  on scroll — debounced, rate limited, and skipped entirely while everything is
+  anchored, so a finished transcript costs one array scan.
+- **“Source not in view” in the panel.** A row whose quote is not currently
+  reachable says so, with a tooltip explaining that scrolling to the reply makes
+  the highlight and badge appear on their own.
+
+### Changed
+
+- `reanchor()` reports how many ranges it attached, and the retry pass repaints
+  only on real progress. An unconditional repaint mutated the DOM, re-armed the
+  observer that scheduled the pass, and would have spun on a quote that is simply
+  not loaded yet.
+
+### Docs
+
+- Recorded why the block is not written into the session log: it would add
+  visible transcript content, and a new event type cannot be appended at all —
+  DSH accepts an unknown stored event only with an `ignorable: true` envelope,
+  which a live `Session.append()` cannot set, so the session would refuse to
+  reopen. The option remains on the roadmap as an explicitly-costed strict mode.
+
+[0.3.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.2.0...v0.3.0
+
 ## [0.2.0] - 2026-10-03
 
 ### Added
