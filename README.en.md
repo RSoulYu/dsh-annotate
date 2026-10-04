@@ -31,9 +31,11 @@ an annotation block to it:
 请用「Annotation 1：…」的格式逐条回应；…
 ```
 
-Nothing is written into the composer, and your own bubble still shows only what
-you typed. `cordis.patch.yml` inserts exactly one host row; no DSH core file is
-touched.
+Nothing is written into the composer, so nothing can be overwritten and lost on
+submit. The block does become a visible part of that message, though: the host
+appends it to the `user/message` about to enter the model, so it shows up in the
+session log and in your own bubble (see [Limitations](#limitations) item 1).
+`cordis.patch.yml` inserts exactly one host row; no DSH core file is touched.
 
 ## Features
 
@@ -42,7 +44,7 @@ touched.
 | Select to annotate | A small one-button toolbar appears above the selection; it is viewport-clamped and never overlaps the composer or the submit button |
 | Note optional | Empty note = mark the quote only |
 | Read in place | Click the numbered badge next to the quote for a popover with the quote, the note, and jump-to-source / open-in-sidebar / delete |
-| No DOM surgery | Highlights use the CSS Custom Highlight API; message content is never modified |
+| No DOM surgery | Highlights use the CSS Custom Highlight API; no node is injected into or rewritten inside a rendered message. That is about the DOM — delivery does append the block to the message text, see [Limitations](#limitations) item 1 |
 | Composer chip | `✎ ×N` in the composer tool row, immediately before Send; rendered only when the session has annotations |
 | Right-sidebar panel | A two-stage right-sidebar tab with edit / delete / jump / clear-delivered / refresh |
 | Durable | `$DSH_HOME/annotations/annotations.json`, shared across sessions and restarts, outside every workspace |
@@ -90,15 +92,28 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 ## Limitations
 
-1. **The block is model-side context, not a session-log event — deliberately, and
-   it is not what makes annotations persistent.** The annotations themselves live
-   in `$DSH_HOME/annotations/annotations.json`, so restarting DSH and reopening
-   the session restores the chip, the sidebar list and every status; highlights
-   and badges re-locate by quote (and appear as the quoted message renders).
-   Writing the block into the log would (a) put visible content in the transcript
-   — the one thing this plugin avoids — and (b) require an event type DSH accepts,
-   since a live `Session.append()` cannot set the `ignorable: true` envelope that
-   unknown stored events need, and a session holding one refuses to reopen.
+1. **The block is merged into your own message, so it lands in the session log
+   and in your own bubble.** The annotations themselves live in
+   `$DSH_HOME/annotations/annotations.json`, so restarting DSH and reopening the
+   session restores the chip, the sidebar list and every status; highlights and
+   badges re-locate by quote (and appear as the quoted message renders). That
+   layer is independent of delivery.
+   Delivery happens at `agent/pre-step`: the block is appended to the `content`
+   of the `user/message` entering the step, and DSH then appends that message to
+   the session log and renders it as your bubble — so the transcript shows the
+   block, and your bubble is no longer only your own words.
+   This cannot be traded for "model-only, unlogged": DSH requires model-visible
+   content to use a logged channel, and `agent/pre-step` may only rewrite a
+   message that is about to be logged. A brand-new event type will not work
+   either, since a live `Session.append()` cannot set the `ignorable: true`
+   envelope that unknown stored events need, and a session holding one refuses
+   to reopen.
+   Two consequences worth knowing before you rely on it: (a) **deleting a
+   delivered annotation does not retract it from the transcript** — that text is
+   already part of your message, and deleting only removes the annotation record
+   with its badge and highlight; (b) **exporting, sharing or copying that session
+   carries the quoted text and your annotation notes with it.** The other way
+   round, regenerate/fork *does* show the block to the model again.
 2. **Host-half edits need a restart** (see above).
 3. **Re-anchoring after a reload is quote-based, and now lazy:** a quote whose
    message is not loaded yet is marked “source not in view” in the panel and is

@@ -4,6 +4,44 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-04
+
+### Fixed
+
+- **The documented behaviour of delivery was wrong, and it was wrong in the
+  direction that matters.** Both READMEs claimed the block is "model-side
+  context, not a session-log event" and that "your own bubble still shows only
+  what you typed". Neither has ever been true: `agent/pre-step` returns the
+  claimed `user/message` with the block appended to its `content`, and the loop
+  appends exactly that message to the session log
+  (`dsh-agent-loop/lib/index.js`, the single `user/message` append). The chat
+  half then joins every `text` block of that message into one bubble string
+  (`contentParts` → `UserStyleBubble`), so the block renders **inside your own
+  bubble** and is re-sent on regenerate/fork.
+
+  Verified against three delivered annotations in a local session log: each was a
+  `user/message` with `source.kind: "user"`, `surfaceOp: "append"` and two text
+  blocks — your text, then the block.
+
+  The docs now state what actually happens, including the two consequences a
+  user has to plan around: **deleting a delivered annotation does not retract the
+  text from the transcript**, and **exporting or sharing that session carries the
+  quoted text and the notes with it**. No runtime behaviour changed in this
+  release — only the claims.
+
+### Docs
+
+- Recorded why "model-only, unlogged" is not an option rather than a choice:
+  DSH requires model-visible content to use a logged channel, and the
+  `ignorable: true` envelope that unknown stored events need cannot be set by a
+  live `Session.append()`.
+- Re-scoped the roadmap item that used to promise "regenerate/fork can see it"
+  as the *upside* of strict mode (it is already true today) into what it really
+  is: an appearance trade-off that would move the block out of your bubble into
+  a separate injected-context row.
+
+[0.3.1]: https://github.com/RSoulYu/dsh-annotate/compare/v0.3.0...v0.3.1
+
 ## [0.3.0] - 2026-10-03
 
 ### Added
