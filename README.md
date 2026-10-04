@@ -351,8 +351,10 @@ dsh-annotate/
 
 ```sh
 node --check index.js && node --check client.js   # 语法检查
-node --test test/                                 # 23 个单测
+node --test                                       # 23 个单测（自动发现 test/）
 ```
+
+> 单测命令**不要带 `test/` 这个路径参数**：Node 22 会把位置参数当成模块路径去 `require`，直接 `MODULE_NOT_FOUND` 退出；Node 20 与 26 则会把它当目录展开。不带参数时，三个版本都会自动发现 `test/` 下的测试文件。CI 在 Node 20 与 22 上各跑一遍，历史上正是因为这条命令而一直是红的（见 CHANGELOG 0.3.2）。
 
 | 测试文件 | 覆盖 |
 |---|---|

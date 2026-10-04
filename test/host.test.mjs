@@ -5,7 +5,7 @@
  * test covers the part that decides whether an annotation ever reaches the
  * model.
  *
- * Run with: node --test test/
+ * Run with: node --test
  */
 
 import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises'

@@ -6,7 +6,7 @@
  * token requirement are the only things standing between a page (or a local
  * process) and the annotation store.
  *
- * Run with: node --test test/
+ * Run with: node --test
  */
 
 import test from 'node:test'

@@ -1,6 +1,6 @@
 {
   "name": "dsh-annotate",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
   "description": "Select text in the DSH Web transcript, annotate it, and the host delivers the annotations with the next message you send — the model answers them by number.",
@@ -57,6 +57,6 @@
   },
   "scripts": {
     "check": "node --check index.js && node --check client.js",
-    "test": "node --test test/"
+    "test": "node --test"
   }
 }

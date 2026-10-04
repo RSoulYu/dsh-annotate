@@ -141,8 +141,12 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 ```sh
 node --check index.js && node --check client.js
-node --test test/          # 23 tests: delivery, authorization, anchoring
+node --test                # 23 tests: delivery, authorization, anchoring
 ```
+
+Do **not** pass `test/` to the runner. Node 22 resolves a positional argument as a
+module path and exits with `MODULE_NOT_FOUND`, while Node 20 and 26 expand it as a
+directory. With no arguments every version in the CI matrix discovers `test/`.
 
 The anchoring tests exercise the shipped code: the core is marked `@pure-anchor`
 inside `client.js` and the test evaluates that exact slice, so there is no second

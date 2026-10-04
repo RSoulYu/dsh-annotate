@@ -6,7 +6,7 @@
  * `@pure-anchor` markers and evaluates exactly that source, so what runs here is
  * the shipped code — there is no second copy to drift out of sync.
  *
- * Run with: node --test test/
+ * Run with: node --test
  */
 
 import test from 'node:test'

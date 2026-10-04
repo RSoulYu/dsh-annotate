@@ -4,6 +4,41 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-10-04
+
+### Fixed
+
+- **CI had been red on every push since 0.1.0, and the test command was the
+  cause.** Each of the four `ci` runs failed. The *Host-half tests* step ran
+  `node --test test/`, and Node 22 resolves a positional argument as a module
+  path instead of a directory, so it exited 1 with
+  `Cannot find module '.../test'`. Node 20 expands the same argument as a
+  directory and passed — but the matrix defaults to fail-fast, so the 20 job was
+  cancelled during setup and the run never reported that. Local runs could not
+  catch it either: they use Node 26, which also accepts a directory.
+
+  The workflow step and the `test` script now call `node --test` with **no**
+  argument, which discovers `test/**` on Node 20, 22 and 26. Verified by running
+  the full CI step list (syntax check, manifest sanity, tests) under Node
+  `20.19.5` and `22.20.0`: 23/23 tests pass on both. `22.20.0` reproduces the old
+  failure exactly (`pass 0`, `fail 1`, `MODULE_NOT_FOUND`).
+
+  The matrix also sets `fail-fast: false`, so a version-specific failure reports
+  both legs instead of hiding one — that cancellation is what made this take four
+  pushes to notice.
+
+  Cost: none at runtime; no plugin behaviour changed. The visible difference is
+  that the repository's CI now actually goes green, which is what the README's
+  "CI runs on every push" claim already implied.
+
+### Docs
+
+- `README`/`README.en` development sections now say `node --test` and explain
+  why the path argument must not be passed, so the broken form is not copied
+  back in.
+
+[0.3.2]: https://github.com/RSoulYu/dsh-annotate/compare/v0.3.1...v0.3.2
+
 ## [0.3.1] - 2026-10-04
 
 ### Fixed

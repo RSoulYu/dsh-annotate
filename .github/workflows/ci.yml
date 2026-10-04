@@ -10,6 +10,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     strategy:
+      # Report every Node version even when one fails: with the default
+      # fail-fast, a failure on 22 cancels the 20 job mid-flight and the run
+      # stops telling you whether 20 passed.
+      fail-fast: false
       matrix:
         node: ['20', '22']
     steps:
@@ -28,4 +32,8 @@ jobs:
         run: node -e "const p=require('./package.json'); if(!p.dsh?.bundle?.patch||!p.dsh?.client) { throw new Error('dsh manifest incomplete') }; console.log(p.name, p.version)"
 
       - name: Host-half tests
-        run: node --test test/
+        # No path argument on purpose. Node 22 resolves a positional argument as
+        # a module path, so `node --test test/` dies with MODULE_NOT_FOUND;
+        # Node 20 and 26 expand it as a directory. Without arguments the runner
+        # discovers `test/**` on every version in the matrix.
+        run: node --test
