@@ -85,6 +85,27 @@ function userStep(text) {
   }
 }
 
+/**
+ * Publish one session event the way `Session.append` does. Delivery is
+ * confirmed off this stream, so the tests have to drive it.
+ */
+function emitSession(captured, sessionId, type, data) {
+  const handler = captured.events.get('session/event')
+  assert.equal(typeof handler, 'function', 'the plugin observes session/event')
+  handler({ id: sessionId }, { type, data })
+}
+
+/** Let the store's asynchronous flush reach the file. */
+function settle() {
+  return new Promise((resolve) => setTimeout(resolve, 20))
+}
+
+/** Read the persisted store back as a map by id. */
+async function storedById(home) {
+  const stored = JSON.parse(await readFile(join(home, 'annotations', 'annotations.json'), 'utf8'))
+  return new Map(stored.annotations.map((item) => [item.id, item]))
+}
+
 function record(overrides) {
   return {
     id: overrides.id,
@@ -98,12 +119,13 @@ function record(overrides) {
   }
 }
 
-test('registers exactly one tool and one pre-step listener', async () => {
+test('registers exactly one tool, a pre-step listener and the receipt listener', async () => {
   await withPlugin([], async ({ captured }) => {
     assert.equal(captured.tools.length, 1)
     assert.equal(captured.tools[0].name, 'annotation')
     assert.deepEqual(captured.tools[0].parameters.required, ['action'])
     assert.equal(typeof captured.events.get('agent/pre-step'), 'function')
+    assert.equal(typeof captured.events.get('session/event'), 'function')
   })
 })
 
@@ -139,12 +161,88 @@ test('delivers pending annotations with the next user message', async () => {
     assert.doesNotMatch(block, /别的会话/, 'other sessions must not leak in')
     assert.doesNotMatch(block, /第二处原文/, 'delivered annotations are not re-sent')
 
-    const stored = JSON.parse(await readFile(join(home, 'annotations', 'annotations.json'), 'utf8'))
-    const byId = new Map(stored.annotations.map((item) => [item.id, item]))
+    // Injecting is not delivering: until the log publishes the message that
+    // carries the block, the annotations must still read as unsent.
+    let byId = await storedById(home)
+    assert.equal(byId.get('a1').status, 'pending', 'injection alone must not mark anything delivered')
+    assert.equal(byId.get('a3').status, 'pending')
+
+    emitSession(captured, 'session-alpha', 'user/message', decision.messages[0])
+    await settle()
+    byId = await storedById(home)
     assert.equal(byId.get('a1').status, 'delivered')
     assert.equal(byId.get('a1').deliveredTurn, 4)
     assert.equal(byId.get('a3').status, 'delivered')
     assert.equal(byId.get('b1').status, 'pending', 'another session stays pending')
+  })
+})
+
+test('a block the log never carries is not delivered', async () => {
+  await withPlugin([record({ id: 'a1', note: '别丢' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      async () => userStep('问题'),
+    )
+
+    // Another session's append, and a message that does not carry the block.
+    emitSession(captured, 'session-beta', 'user/message', { content: [{ type: 'text', text: '别的会话' }] })
+    emitSession(captured, 'session-alpha', 'user/message', { content: [{ type: 'text', text: '没有块的消息' }] })
+    await settle()
+
+    const byId = await storedById(home)
+    assert.equal(byId.get('a1').status, 'pending', 'only the block itself may confirm a delivery')
+  })
+})
+
+test('a turn that ends without the block re-delivers it on the next message', async () => {
+  await withPlugin([record({ id: 'a1', quote: '会被丢掉吗' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    const first = await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      async () => userStep('问题'),
+    )
+    assert.equal(first.messages[0].content.length, 2)
+
+    // While the receipt is unconfirmed nothing else is injected into that
+    // session: the block may already be in the log.
+    const sameTurn = await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 2, messages: [] },
+      async () => userStep('问题'),
+    )
+    assert.equal(sameTurn.messages[0].content.length, 1, 'no duplicate block while one is in flight')
+
+    // The stop button aborted the turn before the loop appended the message.
+    emitSession(captured, 'session-alpha', 'turn/end', { turn: 4, reason: { kind: 'aborted' } })
+    assert.equal((await storedById(home)).get('a1').status, 'pending', 'an aborted turn delivers nothing')
+
+    const second = await handler(
+      { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: [] },
+      async () => userStep('再问一次'),
+    )
+    assert.equal(second.messages[0].content.length, 2, 'the next message carries it again')
+    assert.match(second.messages[0].content[1].text, /会被丢掉吗/)
+
+    emitSession(captured, 'session-alpha', 'user/message', second.messages[0])
+    await settle()
+    assert.equal((await storedById(home)).get('a1').status, 'delivered')
+  })
+})
+
+test('a step/end without the block clears the receipt so it can be re-sent', async () => {
+  await withPlugin([record({ id: 'a1' })], async ({ captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    await handler(
+      { agent: { id: 'session-alpha' }, turn: 6, step: 1, messages: [] },
+      async () => userStep('问题'),
+    )
+    // The step is over (it failed before the append) but the turn continues.
+    emitSession(captured, 'session-alpha', 'step/end', { turn: 6, step: 1 })
+    const next = await handler(
+      { agent: { id: 'session-alpha' }, turn: 6, step: 2, messages: [] },
+      async () => userStep('问题'),
+    )
+    assert.equal(next.messages[0].content.length, 2, 'the receipt was dropped, so the block rides again')
   })
 })
 
@@ -154,8 +252,15 @@ test('a later step of the same turn carries nothing extra', async () => {
     const payload = { agent: { id: 'session-alpha' }, turn: 7, step: 1, messages: [] }
     const first = await handler(payload, async () => userStep('问题'))
     assert.equal(first.messages[0].content.length, 2)
+    emitSession(captured, 'session-alpha', 'user/message', first.messages[0])
+    await settle()
     const second = await handler({ ...payload, step: 2 }, async () => userStep('问题'))
     assert.equal(second.messages[0].content.length, 1, 'already delivered, no second injection')
+    const laterTurn = await handler(
+      { agent: { id: 'session-alpha' }, turn: 8, step: 1, messages: [] },
+      async () => userStep('新问题'),
+    )
+    assert.equal(laterTurn.messages[0].content.length, 1, 'and nothing on the messages after that')
   })
 })
 

@@ -4,6 +4,57 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-10-05
+
+### Fixed
+
+- **A delivery could be recorded as done while the block never reached the
+  model.** The pre-step listener marked the pending annotations delivered as soon
+  as it returned the rewritten message, but `agent/pre-step` is not the last step
+  before the append: the loop checks its abort signal and then runs
+  `prepareRequest`, and only after both does it append `decision.messages` to the
+  session log. A turn stopped inside that window — or one whose request
+  preparation failed — left the annotations marked "已送达" while the model had
+  never seen them, and they were never sent again. The module doc claimed there
+  was "nothing that can silently drop the block"; that was not true.
+
+  Delivery is now **confirmed rather than assumed**. The host records the receipt
+  of what it injected (the block's own header line, the annotation ids, and the
+  `turn`/`step` it went into) and marks those annotations delivered only when
+  `session/event` publishes the `user/message` that actually carries that text.
+  `Session.append` dispatches its observers synchronously, so the confirmation
+  lands before the request is built — no new marker is written into the message
+  and no extra field is added to the log; the receipt is text the model reads
+  anyway.
+
+  When the step (`step/end`) or the turn (`turn/end`) ends without the receipt,
+  the receipt is dropped and the annotations stay pending, so the next message
+  carries them again — which is what "my annotation was never answered" should
+  do. While one receipt is unconfirmed the session injects nothing further, so a
+  block that did land cannot be duplicated.
+
+  Cost: one `session/event` listener with an O(1) map lookup per event; the panel
+  now shows "待发送" for the few hundred milliseconds between sending and the
+  message entering the log instead of flipping early. One narrow duplicate window
+  remains: if the process exits after the block reached the log but before the new
+  status was flushed to disk, the next boot still reads those annotations as
+  pending and sends them once more.
+
+  Verified with 26/26 tests (`node --test`), including three new cases: injection
+  alone is not delivery, an aborted turn re-sends on the next message, and an
+  unconfirmed receipt blocks a second injection. The receipt match was also
+  checked against real logged sessions: the rendered block is byte-identical to
+  the `user/message` the loop appended, and every block-bearing message in the
+  local history consists of the user's own text plus exactly one appended block.
+
+### Docs
+
+- `README`/`README.en`: the delivery description, the "delivered once" feature
+  row, the defect list and the test inventory now describe the confirmed
+  delivery, including the cost of the confirmation and the duplicate window.
+
+[0.3.3]: https://github.com/RSoulYu/dsh-annotate/compare/v0.3.2...v0.3.3
+
 ## [0.3.2] - 2026-10-04
 
 ### Fixed

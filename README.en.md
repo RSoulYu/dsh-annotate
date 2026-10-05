@@ -49,7 +49,7 @@ session log and in your own bubble (see [Limitations](#limitations) item 1).
 | Right-sidebar panel | A two-stage right-sidebar tab with edit / delete / jump / clear-delivered / refresh |
 | Durable | `$DSH_HOME/annotations/annotations.json`, shared across sessions and restarts, outside every workspace |
 | Stable numbering | Panel #3 is `Annotation 3` in the reply |
-| Delivered once | Annotations are marked delivered when injected and never re-sent |
+| Delivered once | Annotations are marked delivered only once the session log carries the message holding their block, and are never re-sent |
 | Agent tool | `annotation` with `list` / `resolve` actions, for re-reading after a compaction |
 
 ## Install
@@ -77,7 +77,11 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 - **Nothing can silently drop an annotation.** Delivery is decoupled from the
   composer, from the transcript DOM and from keyboard timing — the three usual
-  causes of "I marked it but the model never saw it".
+  causes of "I marked it but the model never saw it". "Delivered" is a *confirmed*
+  state, not an assumption: `agent/pre-step` only proposes the block, and the
+  annotations are marked delivered once the session log publishes the message
+  that carries it. A step stopped or failed before that point leaves them
+  pending, and the next message you send carries them again.
 - **Zero intrusion.** No DSH core changes, no injected nodes inside messages, no
   key interception.
 - **Readable model context.** One numbered block with quoted sources, and an
@@ -127,21 +131,31 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 5. **Text only.** Text inside images or inside structured tool-call cards cannot
    be selected.
 6. **Numbering is per session.**
-7. **The local HTTP route is fenced, not private.** Two gates: the `Host` must be
+7. **Delivery waits for the next message to enter the model.** If the model is
+   busy and your message is queued, the block rides that queued message when it is
+   processed; if the message is never processed, the annotations stay "pending".
+   Delivery is confirmed by the session log: `agent/pre-step` returns before the
+   loop's abort check and before `prepareRequest`, so pressing stop (or a request
+   that fails while being prepared) means the message is never appended, the
+   annotations go back to "pending" and ride your next message. The cost is one
+   narrow duplicate window — if the process exits after the block reached the log
+   but before the "delivered" status was written, those annotations still read as
+   pending next boot and are sent once more.
+8. **The local HTTP route is fenced, not private.** Two gates: the `Host` must be
    loopback (DNS rebinding), and the request must carry a per-boot token that is
    written only into the boot payload of pages this process served. A local
    process running as the same user can still read
    `~/.dsh/annotations/annotations.json` directly (mode `0600`).
-8. **Plaintext storage** (`0600`). Sensitive text pasted into a note stays in
+9. **Plaintext storage** (`0600`). Sensitive text pasted into a note stays in
    `~/.dsh/annotations/` until you delete it.
-9. **Verified on Linux only.** The code uses `node:*` builtins and browser APIs,
-   so it should be portable, but macOS/Windows are untested.
+10. **Verified on Linux only.** The code uses `node:*` builtins and browser APIs,
+    so it should be portable, but macOS/Windows are untested.
 
 ## Development
 
 ```sh
 node --check index.js && node --check client.js
-node --test                # 23 tests: delivery, authorization, anchoring
+node --test                # 26 tests: delivery, authorization, anchoring
 ```
 
 Do **not** pass `test/` to the runner. Node 22 resolves a positional argument as a

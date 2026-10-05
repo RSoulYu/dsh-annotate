@@ -12,12 +12,21 @@
  *      on its own, and
  *   4. delivers them at `agent/pre-step`: the annotation block is appended to
  *      the user message entering the step, so the model receives it with the
- *      message the user actually sent — no composer DOM, no draft rewriting,
- *      nothing that can silently drop the block.
+ *      message the user actually sent — no composer DOM, no draft rewriting.
  *
- * Delivery is deliberately "once per message": the pre-step listener only
- * fires while annotations are pending, and injection marks them delivered, so
- * the later steps of the same turn carry nothing extra.
+ * Delivery is deliberately "once per message", and it is confirmed rather than
+ * assumed: the pre-step listener injects the block and remembers the receipt
+ * (the block's own header line) plus the step it went into, and the annotations
+ * are marked delivered only once the session log publishes the `user/message`
+ * that carries that receipt. Returning `enter` does not guarantee the step
+ * reaches the log — the loop checks its abort signal, and runs `prepareRequest`,
+ * before it appends — so a block that never landed must not be reported as
+ * delivered. When the step or turn ends without the receipt, the annotations
+ * stay pending and ride the next message, which is exactly the retry the user
+ * expects after a stop or a failed request.
+ *
+ * While one receipt is unconfirmed the session injects nothing further: the
+ * block may already be in the log, and a second injection would duplicate it.
  *
  * Runtime imports stay on `node:*` builtins on purpose: a workspace-installed
  * bundle cannot resolve `@deepseek-ai/*` packages, so the host half must be
@@ -42,7 +51,7 @@ export const inject = ['tools']
  * re-activated; the tool reports this value so "which revision is live" is
  * answerable without a restart-and-guess.
  */
-const REVISION = 3
+const REVISION = 4
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
 const STORE_VERSION = 1
@@ -323,6 +332,37 @@ function renderBlock(records, numbers) {
 }
 
 /**
+ * The delivery receipt of one rendered block: its header line.
+ *
+ * This is what the store waits for in the session log before calling an
+ * annotation delivered. Nothing is added to the message for bookkeeping — the
+ * receipt is text the model already reads, so the log stays clean and a
+ * receipt cannot be forged by the plugin itself.
+ *
+ * @param block output of {@link renderBlock}.
+ */
+function receiptOf(block) {
+  for (const line of String(block).split('\n')) {
+    if (line.trim().length > 0) return line
+  }
+  return ''
+}
+
+/**
+ * Whether one `user/message` event is the message that carries this receipt.
+ * @param event the appended session event.
+ * @param receipt receipt of the injected block.
+ */
+function eventCarriesReceipt(event, receipt) {
+  if (receipt.length === 0) return false
+  const content = event?.data?.content
+  if (!Array.isArray(content)) return false
+  return content.some(
+    (part) => part?.type === 'text' && typeof part.text === 'string' && part.text.includes(receipt),
+  )
+}
+
+/**
  * Append the annotation block to the last real user message of one step.
  * @returns the replacement message list, or undefined when nothing applies.
  */
@@ -439,6 +479,12 @@ export function apply(ctx) {
   /** Per-boot secret: only a page this process served can present it. */
   const token = randomUUID()
   let tokenPublished = false
+  /**
+   * Delivery receipts still waiting for the log, per session: which annotation
+   * ids went into which step, and the header line that proves it landed.
+   * @type {Map<string, { ids: string[], receipt: string, turn: number, step: number }>}
+   */
+  const inFlight = new Map()
 
   // Hand the token to the served page. `index-inject` runs while the boot HTML
   // is rendered, which always precedes the browser half that reads it, so the
@@ -501,21 +547,62 @@ export function apply(ctx) {
     if (sessionId.length === 0) return decision
     try {
       await store.load()
+      // One receipt at a time. A live one means the previous block may already
+      // be in the log, and injecting it again would duplicate it in the
+      // transcript; the step/end below clears it when it demonstrably did not
+      // land.
+      if (inFlight.has(sessionId)) return decision
       const pending = store.pending(sessionId)
       if (pending.length === 0) return decision
-      const messages = injectIntoMessages(
-        decision.messages,
-        renderBlock(pending, numbering(store.list(sessionId))),
-      )
+      const block = renderBlock(pending, numbering(store.list(sessionId)))
+      const messages = injectIntoMessages(decision.messages, block)
       if (messages === undefined) return decision
-      await store.markDelivered(
-        pending.map((item) => item.id),
-        payload?.turn,
-      )
+      // Deliberately NOT marked delivered here: the loop still has its abort
+      // check and `prepareRequest` to get through before this message is
+      // appended, and a block the model never received is not delivered.
+      inFlight.set(sessionId, {
+        ids: pending.map((item) => item.id),
+        receipt: receiptOf(block),
+        turn: payload?.turn,
+        step: payload?.step,
+      })
       return { ...decision, messages }
     } catch (error) {
       logger.warn?.('dsh-annotate: delivery failed: %o', error)
       return decision
+    }
+  })
+
+  /* ---- delivery receipt: the log is what makes a block delivered ---- */
+  ctx.on('session/event', (session, event) => {
+    const sessionId = asId(session?.id)
+    if (sessionId.length === 0) return
+    const flight = inFlight.get(sessionId)
+    if (flight === undefined) return
+    if (event?.type === 'user/message') {
+      if (!eventCarriesReceipt(event, flight.receipt)) return
+      inFlight.delete(sessionId)
+      // `append` publishes this event synchronously, so the store is already
+      // loaded on this path; the fallback covers a listener attached earlier.
+      const mark = () => store.markDelivered(flight.ids, flight.turn)
+      const settled = store.loaded ? mark() : store.load().then(mark)
+      settled.catch((error) => {
+        logger.warn?.('dsh-annotate: could not record delivery: %o', error)
+      })
+      return
+    }
+    // The step (or the whole turn, when the abort lands before the step even
+    // started) is over and the receipt was never seen: the message was not
+    // appended, so those annotations are still unsent. Drop the receipt and let
+    // the next message carry them.
+    if (event?.type === 'step/end' && event.data?.turn === flight.turn && event.data?.step === flight.step) {
+      inFlight.delete(sessionId)
+      logger.info?.('dsh-annotate: step %s/%s ended without the annotation block; %d annotation(s) stay pending', flight.turn, flight.step, flight.ids.length)
+      return
+    }
+    if (event?.type === 'turn/end' && event.data?.turn === flight.turn) {
+      inFlight.delete(sessionId)
+      logger.info?.('dsh-annotate: turn %s ended without the annotation block; %d annotation(s) stay pending', flight.turn, flight.ids.length)
     }
   })
 
