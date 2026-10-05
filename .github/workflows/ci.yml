@@ -36,4 +36,15 @@ jobs:
         # a module path, so `node --test test/` dies with MODULE_NOT_FOUND;
         # Node 20 and 26 expand it as a directory. Without arguments the runner
         # discovers `test/**` on every version in the matrix.
-        run: node --test
+        run: |
+          set -o pipefail
+          node --test 2>&1 | tee test-output.txt
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            # A job log needs repository admin rights to read over the API, but
+            # check-run annotations do not. Publish the tail of the failure as a
+            # single annotation (newlines escaped) so a failure on this
+            # repository can actually be diagnosed from outside.
+            tail -n 80 test-output.txt | sed ':a;N;$!ba;s/\n/%0A/g' | sed 's/^/::error::Host-half tests failed:%0A/'
+          fi
+          exit "$status"

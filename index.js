@@ -619,10 +619,12 @@ export function apply(ctx) {
       // loaded on this path; the fallback covers a listener attached earlier.
       const mark = () => store.markDelivered(flight.ids, flight.turn)
       const settled = store.loaded ? mark() : store.load().then(mark)
-      settled.catch((error) => {
+      // Returning the promise does not hold the append up — the event is
+      // already in the log, and DSH only contains observer rejections — but it
+      // makes "this delivery is persisted" awaitable instead of a guess.
+      return settled.catch((error) => {
         logger.warn?.('dsh-annotate: could not record delivery: %o', error)
       })
-      return
     }
     // The step (or the whole turn, when the abort lands before the step even
     // started) is over and the receipt was never seen: the message was not

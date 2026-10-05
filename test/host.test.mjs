@@ -101,16 +101,14 @@ function blockTextOf(decision) {
 /**
  * Publish one session event the way `Session.append` does. Delivery is
  * confirmed off this stream, so the tests have to drive it.
+ *
+ * Awaiting the handler awaits the persisted delivery itself — no sleeping and
+ * guessing that the store's asynchronous flush has landed.
  */
-function emitSession(captured, sessionId, type, data) {
+async function emitSession(captured, sessionId, type, data) {
   const handler = captured.events.get('session/event')
   assert.equal(typeof handler, 'function', 'the plugin observes session/event')
-  handler({ id: sessionId }, { type, data })
-}
-
-/** Let the store's asynchronous flush reach the file. */
-function settle() {
-  return new Promise((resolve) => setTimeout(resolve, 20))
+  await handler({ id: sessionId }, { type, data })
 }
 
 /** Read the persisted store back as a map by id. */
@@ -217,8 +215,7 @@ test('delivers pending annotations with the next user message', async () => {
     assert.equal(byId.get('a1').status, 'pending', 'injection alone must not mark anything delivered')
     assert.equal(byId.get('a3').status, 'pending')
 
-    emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(decision))
-    await settle()
+    await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(decision))
     byId = await storedById(home)
     assert.equal(byId.get('a1').status, 'delivered')
     assert.equal(byId.get('a1').deliveredTurn, 4)
@@ -236,9 +233,8 @@ test('a block the log never carries is not delivered', async () => {
     )
 
     // Another session's append, and a message that does not carry the block.
-    emitSession(captured, 'session-beta', 'user/message', { content: [{ type: 'text', text: '别的会话' }] })
-    emitSession(captured, 'session-alpha', 'user/message', { content: [{ type: 'text', text: '没有块的消息' }] })
-    await settle()
+    await emitSession(captured, 'session-beta', 'user/message', { content: [{ type: 'text', text: '别的会话' }] })
+    await emitSession(captured, 'session-alpha', 'user/message', { content: [{ type: 'text', text: '没有块的消息' }] })
 
     const byId = await storedById(home)
     assert.equal(byId.get('a1').status, 'pending', 'only the block itself may confirm a delivery')
@@ -273,8 +269,7 @@ test('a turn that ends without the block re-delivers it on the next message', as
     assert.equal(second.messages.length, 2, 'the next message carries it again')
     assert.match(blockTextOf(second), /会被丢掉吗/)
 
-    emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(second))
-    await settle()
+    await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(second))
     assert.equal((await storedById(home)).get('a1').status, 'delivered')
   })
 })
@@ -302,8 +297,7 @@ test('a later step of the same turn carries nothing extra', async () => {
     const payload = { agent: { id: 'session-alpha' }, turn: 7, step: 1, messages: [] }
     const first = await handler(payload, async () => userStep('问题'))
     assert.equal(first.messages.length, 2)
-    emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(first))
-    await settle()
+    await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(first))
     const second = await handler({ ...payload, step: 2 }, async () => userStep('问题'))
     assert.equal(second.messages.length, 1, 'already delivered, no second injection')
     const laterTurn = await handler(

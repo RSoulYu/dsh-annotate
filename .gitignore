@@ -14,3 +14,4 @@ Thumbs.db
 # Local scratch
 *.tmp
 /tmp/
+test-output.txt
