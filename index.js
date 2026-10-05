@@ -10,9 +10,15 @@
  *      (`POST /plugins/dsh-annotate/api`),
  *   3. registers the `annotation` tool so the agent can read and resolve them
  *      on its own, and
- *   4. delivers them at `agent/pre-step`: the annotation block is appended to
- *      the user message entering the step, so the model receives it with the
- *      message the user actually sent — no composer DOM, no draft rewriting.
+ *   4. delivers them at `agent/pre-step`: the annotation block is put on the
+ *      wire as its own message, right after the user message entering the step,
+ *      so the model receives it with the message the user actually sent — no
+ *      composer DOM, no draft rewriting. The block is a separate `user/message`
+ *      whose `source.kind` is not `user`, which is what keeps it out of the
+ *      user's own bubble: the chat renders an appended `user/message` as a
+ *      bubble only for `source.kind === "user"` and as an injected-context row
+ *      otherwise (`@deepseek-ai/dsh-client-ui-chat`, `messageDefinition` →
+ *      `contextMessage`). It is still a logged, model-visible message.
  *
  * Delivery is deliberately "once per message", and it is confirmed rather than
  * assumed: the pre-step listener injects the block and remembers the receipt
@@ -51,9 +57,16 @@ export const inject = ['tools']
  * re-activated; the tool reports this value so "which revision is live" is
  * answerable without a restart-and-guess.
  */
-const REVISION = 4
+const REVISION = 5
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
+/**
+ * `source.kind` of the message that carries the block. Anything other than
+ * `user` makes the chat render that message as an injected-context row instead
+ * of the user's own bubble, which is the whole point of sending the block as a
+ * message of its own.
+ */
+const BLOCK_SOURCE_KIND = 'dsh-annotate'
 const STORE_VERSION = 1
 const MAX_BODY_BYTES = 512 * 1024
 const MAX_QUOTE = 2000
@@ -303,10 +316,10 @@ function numbering(records) {
 /**
  * Render the block the model reads.
  *
- * The block is appended to the message the user sent, and the transcript
- * renders the model-facing content, so it must start with a blank line: the
- * annotation section has to read as its own paragraph, never glued to the
- * user's own sentence.
+ * The block travels as its own message, so it does not need to separate itself
+ * from the user's text with a leading blank line any more: the message boundary
+ * does that. It still ends with a newline so the instruction line is a
+ * paragraph of its own.
  *
  * @param records pending records in creation order.
  * @param {Map<string, number>} numbers stable per-session numbers.
@@ -328,7 +341,7 @@ function renderBlock(records, numbers) {
       '不要复述原文，先直接回答问题，需要时再引用被批注的句子。',
   )
   lines.push('')
-  return `\n\n${lines.join('\n')}`
+  return lines.join('\n')
 }
 
 /**
@@ -363,7 +376,33 @@ function eventCarriesReceipt(event, receipt) {
 }
 
 /**
- * Append the annotation block to the last real user message of one step.
+ * Build the message that carries the block.
+ *
+ * `role` must stay `user`: the session store rejects a `user/message` event
+ * whose role is anything else. `source.kind` is the only lever — it is what
+ * keeps the row out of the user's own bubble.
+ *
+ * @param block output of {@link renderBlock}.
+ */
+function blockMessage(block) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    source: { kind: BLOCK_SOURCE_KIND },
+    content: [{ type: 'text', text: block }],
+  }
+}
+
+/**
+ * Put the annotation block on the wire as its own message, immediately after
+ * the last user message of one step.
+ *
+ * The user's own message is returned untouched: the block is an additional
+ * entry in the list, not extra text on their message. DSH appends every entry
+ * of `decision.messages` as its own event, so the block still lands in the log
+ * (and therefore still reaches the model), it just stops being part of the
+ * words the user typed.
+ *
  * @returns the replacement message list, or undefined when nothing applies.
  */
 function injectIntoMessages(messages, block) {
@@ -386,14 +425,8 @@ function injectIntoMessages(messages, block) {
     }
   }
   if (index === -1) return undefined
-  const target = messages[index]
-  const content = Array.isArray(target.content) ? target.content : []
-  const next = {
-    ...target,
-    content: [...content, { type: 'text', text: block }],
-  }
   const out = messages.slice()
-  out[index] = next
+  out.splice(index + 1, 0, blockMessage(block))
   return out
 }
 
@@ -539,7 +572,7 @@ export function apply(ctx) {
     )
   })
 
-  /* ---- delivery: append the block to the message entering the step ---- */
+  /* ---- delivery: send the block as its own message, right after the user's ---- */
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     if (decision?.kind !== 'enter') return decision

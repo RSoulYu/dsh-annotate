@@ -3,7 +3,9 @@
  *
  * The browser half is verified live through the client Slot inspector; this
  * test covers the part that decides whether an annotation ever reaches the
- * model.
+ * model — including the shape of the message that carries it, because the chat
+ * only keeps the block out of the user's bubble when that message's
+ * `source.kind` is not `user`.
  *
  * Run with: node --test
  */
@@ -85,6 +87,17 @@ function userStep(text) {
   }
 }
 
+/** The injected block message of one decision, or undefined when there is none. */
+function blockMessageOf(decision) {
+  return decision.messages.find((message) => message?.source?.kind === 'dsh-annotate')
+}
+
+/** The rendered block text of one decision. */
+function blockTextOf(decision) {
+  const message = blockMessageOf(decision)
+  return message === undefined ? '' : message.content[0].text
+}
+
 /**
  * Publish one session event the way `Session.append` does. Delivery is
  * confirmed off this stream, so the tests have to drive it.
@@ -129,6 +142,49 @@ test('registers exactly one tool, a pre-step listener and the receipt listener',
   })
 })
 
+test("the user's own message is left untouched; the block travels as its own message", async () => {
+  await withPlugin([record({ id: 'a1', quote: '第一处原文', note: '第一条批注' })], async ({ captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    const original = userStep('这是我的问题')
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      async () => original,
+    )
+
+    assert.equal(decision.kind, 'enter')
+    assert.equal(decision.messages.length, 2, 'the user message plus one block message')
+    assert.deepEqual(decision.messages[0], original.messages[0], 'the message the user sent is returned verbatim')
+    assert.equal(decision.messages[0].content.length, 1, 'no block is appended to the user text')
+
+    const injected = decision.messages[1]
+    assert.equal(injected.role, 'user', 'a user/message event must carry the user role')
+    assert.equal(injected.source.kind, 'dsh-annotate', 'any kind but `user` keeps this row out of the bubble')
+    assert.notEqual(injected.id, 'msg-1', 'the injected message needs its own identity')
+    assert.match(blockTextOf(decision), /第一处原文/, 'the block content still quotes the source')
+  })
+})
+
+test('the injected message satisfies the session user/message contract', async () => {
+  await withPlugin([record({ id: 'a1' })], async ({ captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 1, step: 1, messages: [] },
+      async () => userStep('问题'),
+    )
+    // Mirrors the store's `assertMessageEventShape`: an identified message, the
+    // role the event type implies, a non-empty source kind, and a content array.
+    const injected = blockMessageOf(decision)
+    assert.equal(typeof injected.id, 'string')
+    assert.ok(injected.id.length > 0, 'the event must carry an identified message')
+    assert.equal(injected.role, 'user')
+    assert.equal(typeof injected.source.kind, 'string')
+    assert.ok(injected.source.kind.length > 0, 'the source kind must not be empty')
+    assert.ok(Array.isArray(injected.content))
+    assert.deepEqual(injected.content.map((part) => part.type), ['text'])
+    assert.equal(typeof injected.content[0].text, 'string')
+  })
+})
+
 test('delivers pending annotations with the next user message', async () => {
   const created = Date.now() - 1000
   const records = [
@@ -144,14 +200,8 @@ test('delivers pending annotations with the next user message', async () => {
       async () => userStep('这是我的问题'),
     )
 
-    assert.equal(decision.kind, 'enter')
-    assert.equal(decision.messages.length, 1)
-    const blocks = decision.messages[0].content
-    assert.equal(blocks.length, 2, 'the user text plus one annotation block')
-    assert.equal(blocks[0].text, '这是我的问题')
-    const block = blocks[1].text
-    assert.ok(block.startsWith('\n\n'), 'the block starts with a blank line so it never glues to the user text')
-    assert.match(block, /—— 批注（共 2 处，编号 1、3）——/)
+    const block = blockTextOf(decision)
+    assert.ok(block.startsWith('—— 批注（共 2 处，编号 1、3）——'), 'the block opens with its own header line')
     assert.ok(block.endsWith('\n'), 'the block ends with a newline')
     assert.match(block, /原文：「第一处原文」/)
     assert.match(block, /批注：第一条批注/)
@@ -167,7 +217,7 @@ test('delivers pending annotations with the next user message', async () => {
     assert.equal(byId.get('a1').status, 'pending', 'injection alone must not mark anything delivered')
     assert.equal(byId.get('a3').status, 'pending')
 
-    emitSession(captured, 'session-alpha', 'user/message', decision.messages[0])
+    emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(decision))
     await settle()
     byId = await storedById(home)
     assert.equal(byId.get('a1').status, 'delivered')
@@ -202,7 +252,7 @@ test('a turn that ends without the block re-delivers it on the next message', as
       { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
       async () => userStep('问题'),
     )
-    assert.equal(first.messages[0].content.length, 2)
+    assert.equal(first.messages.length, 2)
 
     // While the receipt is unconfirmed nothing else is injected into that
     // session: the block may already be in the log.
@@ -210,7 +260,7 @@ test('a turn that ends without the block re-delivers it on the next message', as
       { agent: { id: 'session-alpha' }, turn: 4, step: 2, messages: [] },
       async () => userStep('问题'),
     )
-    assert.equal(sameTurn.messages[0].content.length, 1, 'no duplicate block while one is in flight')
+    assert.equal(sameTurn.messages.length, 1, 'no duplicate block while one is in flight')
 
     // The stop button aborted the turn before the loop appended the message.
     emitSession(captured, 'session-alpha', 'turn/end', { turn: 4, reason: { kind: 'aborted' } })
@@ -220,10 +270,10 @@ test('a turn that ends without the block re-delivers it on the next message', as
       { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: [] },
       async () => userStep('再问一次'),
     )
-    assert.equal(second.messages[0].content.length, 2, 'the next message carries it again')
-    assert.match(second.messages[0].content[1].text, /会被丢掉吗/)
+    assert.equal(second.messages.length, 2, 'the next message carries it again')
+    assert.match(blockTextOf(second), /会被丢掉吗/)
 
-    emitSession(captured, 'session-alpha', 'user/message', second.messages[0])
+    emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(second))
     await settle()
     assert.equal((await storedById(home)).get('a1').status, 'delivered')
   })
@@ -242,7 +292,7 @@ test('a step/end without the block clears the receipt so it can be re-sent', asy
       { agent: { id: 'session-alpha' }, turn: 6, step: 2, messages: [] },
       async () => userStep('问题'),
     )
-    assert.equal(next.messages[0].content.length, 2, 'the receipt was dropped, so the block rides again')
+    assert.equal(next.messages.length, 2, 'the receipt was dropped, so the block rides again')
   })
 })
 
@@ -251,16 +301,16 @@ test('a later step of the same turn carries nothing extra', async () => {
     const handler = captured.events.get('agent/pre-step')
     const payload = { agent: { id: 'session-alpha' }, turn: 7, step: 1, messages: [] }
     const first = await handler(payload, async () => userStep('问题'))
-    assert.equal(first.messages[0].content.length, 2)
-    emitSession(captured, 'session-alpha', 'user/message', first.messages[0])
+    assert.equal(first.messages.length, 2)
+    emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(first))
     await settle()
     const second = await handler({ ...payload, step: 2 }, async () => userStep('问题'))
-    assert.equal(second.messages[0].content.length, 1, 'already delivered, no second injection')
+    assert.equal(second.messages.length, 1, 'already delivered, no second injection')
     const laterTurn = await handler(
       { agent: { id: 'session-alpha' }, turn: 8, step: 1, messages: [] },
       async () => userStep('新问题'),
     )
-    assert.equal(laterTurn.messages[0].content.length, 1, 'and nothing on the messages after that')
+    assert.equal(laterTurn.messages.length, 1, 'and nothing on the messages after that')
   })
 })
 
@@ -320,7 +370,7 @@ test('session ids resolve through either agent shape', async () => {
       { agent: { session: { id: 'session-alpha' } }, turn: 2, step: 1 },
       async () => userStep('问题'),
     )
-    assert.equal(decision.messages[0].content.length, 2)
-    assert.match(decision.messages[0].content[1].text, /嵌套形态/)
+    assert.equal(decision.messages.length, 2)
+    assert.match(blockTextOf(decision), /嵌套形态/)
   })
 })

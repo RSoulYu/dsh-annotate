@@ -4,6 +4,55 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-05
+
+### Changed
+
+- **The block is now a message of its own, so it no longer shows up in your own
+  bubble.** Until 0.3.3 the block was appended to the `content` of the user's
+  message. The chat draws an appended `user/message` as a bubble only when its
+  `source.kind` is `user`, so that text rendered as part of what you sent. The
+  block now travels as a **separate** `user/message` whose `source.kind` is
+  `dsh-annotate`, inserted immediately after the message entering the step:
+
+  - the chat classifies any non-`user` source kind as an injected-context row
+    (`@deepseek-ai/dsh-client-ui-chat`, `messageDefinition` → `contextMessage`;
+    `contextProducer` labels the row with the kind), so the transcript shows the
+    block as an injected line and **your bubble keeps only what you typed**;
+  - the message you sent is returned byte for byte — nothing is appended to its
+    content.
+
+  Everything the block promises is unchanged: it is still an appended, logged,
+  model-visible `user/message` event, so the model still receives it together
+  with the message you actually sent, regenerate/fork still re-reads it, and
+  delivery is still confirmed only once the log publishes that message (0.3.3).
+  The rendered block also lost its leading blank line, which only existed to
+  separate it from your sentence inside a single message.
+
+  Cost: the transcript gains one injected-context row, and the model now reads
+  the block as injected context instead of as part of your message. Those are
+  usually weighted the same, but the difference is real, and whether the row
+  renders as intended can only be confirmed in a browser — a unit test can pin
+  the message shape, not the drawing.
+
+  Rollback: this is one commit on the `b/annotation-block-separate-message`
+  branch; reverting the merge commit that brought it to `main` restores the
+  previous in-bubble delivery.
+
+  Verified: the injected message is asserted against the session's
+  `user/message` contract (identified message, `role: "user"`, non-empty source
+  kind, content array), the user's own message is asserted to come back
+  unmodified, and the receipt-based delivery confirmation is re-tested against
+  the new message — 28/28 tests pass.
+
+### Docs
+
+- `README`/`README.en`: the delivery description, the block section, the
+  data/privacy table and the defect list now describe the separate injected
+  message; the roadmap item that proposed this change is done.
+
+[0.4.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.3.3...v0.4.0
+
 ## [0.3.3] - 2026-10-05
 
 ### Fixed
