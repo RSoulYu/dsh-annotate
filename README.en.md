@@ -32,9 +32,11 @@ an annotation block to it:
 ```
 
 Nothing is written into the composer, so nothing can be overwritten and lost on
-submit. The block does become a visible part of that message, though: the host
-appends it to the `user/message` about to enter the model, so it shows up in the
-session log and in your own bubble (see [Limitations](#limitations) item 1).
+submit. The block travels as a message of its own, though: the host puts it right
+after the `user/message` about to enter the model, with a `source.kind` that is
+not `user`, so it lands in the session log as an injected-context row instead of
+inside your own bubble — your message itself is returned byte for byte (see
+[Limitations](#limitations) item 1).
 `cordis.patch.yml` inserts exactly one host row; no DSH core file is touched.
 
 ## Features
@@ -44,7 +46,7 @@ session log and in your own bubble (see [Limitations](#limitations) item 1).
 | Select to annotate | A small one-button toolbar appears above the selection; it is viewport-clamped and never overlaps the composer or the submit button |
 | Note optional | Empty note = mark the quote only |
 | Read in place | Click the numbered badge next to the quote for a popover with the quote, the note, and jump-to-source / open-in-sidebar / delete |
-| No DOM surgery | Highlights use the CSS Custom Highlight API; no node is injected into or rewritten inside a rendered message. That is about the DOM — delivery does append the block to the message text, see [Limitations](#limitations) item 1 |
+| No DOM surgery | Highlights use the CSS Custom Highlight API; no node is injected into or rewritten inside a rendered message. That is about the DOM — delivery does add the block to the transcript, as its own injected-context message, see [Limitations](#limitations) item 1 |
 | Composer chip | `✎ ×N` in the composer tool row, immediately before Send; rendered only when the session has annotations |
 | Right-sidebar panel | A two-stage right-sidebar tab with edit / delete / jump / clear-delivered / refresh |
 | Durable | `$DSH_HOME/annotations/annotations.json`, shared across sessions and restarts, outside every workspace |
@@ -82,6 +84,9 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
   annotations are marked delivered once the session log publishes the message
   that carries it. A step stopped or failed before that point leaves them
   pending, and the next message you send carries them again.
+- **Your own words stay your own.** The block is a separate injected-context
+  message; your bubble never grows text you did not type, and your message is
+  returned byte for byte.
 - **Zero intrusion.** No DSH core changes, no injected nodes inside messages, no
   key interception.
 - **Readable model context.** One numbered block with quoted sources, and an
@@ -96,16 +101,22 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 ## Limitations
 
-1. **The block is merged into your own message, so it lands in the session log
-   and in your own bubble.** The annotations themselves live in
+1. **The block is a message of its own in the session log — not your words.**
+   It is appended as its own `user/message` event whose `source.kind` is
+   `dsh-annotate`, so the chat renders it as an injected-context row and **your
+   own bubble keeps only what you typed**; the `content` of your message is
+   returned untouched. The annotations themselves live in
    `$DSH_HOME/annotations/annotations.json`, so restarting DSH and reopening the
    session restores the chip, the sidebar list and every status; highlights and
    badges re-locate by quote (and appear as the quoted message renders). That
    layer is independent of delivery.
-   Delivery happens at `agent/pre-step`: the block is appended to the `content`
-   of the `user/message` entering the step, and DSH then appends that message to
-   the session log and renders it as your bubble — so the transcript shows the
-   block, and your bubble is no longer only your own words.
+   Delivery happens at `agent/pre-step`: the block is inserted right after the
+   `user/message` entering the step, and DSH appends every message of the step to
+   the log. The chat then decides how to draw an appended `user/message` by its
+   `source.kind` — `user` becomes your bubble, anything else becomes an
+   injected-context row (`@deepseek-ai/dsh-client-ui-chat`, `messageDefinition`
+   → `contextMessage`). So the block is logged and the model reads it, without
+   pretending to be your sentence.
    This cannot be traded for "model-only, unlogged": DSH requires model-visible
    content to use a logged channel, and `agent/pre-step` may only rewrite a
    message that is about to be logged. A brand-new event type will not work
@@ -114,7 +125,7 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
    to reopen.
    Two consequences worth knowing before you rely on it: (a) **deleting a
    delivered annotation does not retract it from the transcript** — that text is
-   already part of your message, and deleting only removes the annotation record
+   already a logged message, and deleting only removes the annotation record
    with its badge and highlight; (b) **exporting, sharing or copying that session
    carries the quoted text and your annotation notes with it.** The other way
    round, regenerate/fork *does* show the block to the model again.
@@ -155,7 +166,7 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 ```sh
 node --check index.js && node --check client.js
-node --test                # 26 tests: delivery, authorization, anchoring
+node --test                # 28 tests: delivery, authorization, anchoring
 ```
 
 Do **not** pass `test/` to the runner. Node 22 resolves a positional argument as a
