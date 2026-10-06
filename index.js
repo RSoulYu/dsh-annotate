@@ -57,7 +57,7 @@ export const inject = ['tools']
  * re-activated; the tool reports this value so "which revision is live" is
  * answerable without a restart-and-guess.
  */
-const REVISION = 5
+const REVISION = 6
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
 /**
@@ -270,6 +270,29 @@ class AnnotationStore {
     if (this.state.annotations.length === before) return false
     await this.flush()
     return true
+  }
+
+  /**
+   * Put one record back in the delivery queue.
+   *
+   * Only the persisted state changes: the record returns to `pending` and the
+   * delivery receipt (`deliveredAt`/`deliveredTurn`) is dropped, so the next
+   * `agent/pre-step` of that session picks it up again like any other pending
+   * annotation. This deliberately does not inject anything itself — injection is
+   * the pre-step listener's job, and it is confirmed off the session log.
+   *
+   * Idempotent: a record that is already pending comes back pending (with a
+   * refreshed `updatedAt`).
+   */
+  async redeliver(id) {
+    const record = this.state.annotations.find((item) => item.id === id)
+    if (record === undefined) return undefined
+    record.status = 'pending'
+    record.deliveredAt = undefined
+    record.deliveredTurn = undefined
+    record.updatedAt = Date.now()
+    await this.flush()
+    return record
   }
 
   async clearDelivered(sessionId) {
@@ -758,6 +781,14 @@ async function handleApi(store, body, sessionId) {
         annotation: toClient(record, numbers),
         annotations: records.map((item) => toClient(item, numbers)),
       }
+    }
+    case 'redeliver': {
+      const id = asId(body?.id)
+      const record = await store.redeliver(id)
+      if (record === undefined) throw new Error(`unknown annotation: ${id}`)
+      const records = store.list(record.sessionId)
+      const numbers = numbering(records)
+      return { annotations: records.map((item) => toClient(item, numbers)) }
     }
     case 'delete': {
       const id = asId(body?.id)

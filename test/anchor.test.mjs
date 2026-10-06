@@ -18,8 +18,8 @@ const from = source.indexOf('/* @pure-anchor')
 const to = source.indexOf('/* @pure-anchor-end */')
 assert.ok(from !== -1 && to > from, 'client.js must carry the @pure-anchor markers')
 
-const { normalizeQuote, buildAnchorIndex, locateQuote } = new Function(
-  `${source.slice(from, to)}\nreturn { normalizeQuote, buildAnchorIndex, locateQuote }`,
+const { normalizeQuote, buildAnchorIndex, locateQuote, quoteOccurrences } = new Function(
+  `${source.slice(from, to)}\nreturn { normalizeQuote, buildAnchorIndex, locateQuote, quoteOccurrences }`,
 )()
 
 /** Build the segment list the browser side would hand to the index. */
@@ -106,4 +106,54 @@ test('an empty segment list is handled', () => {
   const index = buildAnchorIndex([])
   assert.equal(index.text, '')
   assert.equal(locateQuote(index, 'anything', 0), null)
+})
+
+test('quoteOccurrences numbers equal quotes by creation order, for every annotation', () => {
+  // The table is built over the whole session, so it does not care whether an
+  // annotation still has a live range — only `reanchor`'s caller knows that.
+  const annotations = [
+    { id: 'b', quote: 'same here', createdAt: 200 },
+    { id: 'a', quote: 'same here', createdAt: 100 },
+    { id: 'c', quote: 'same here', createdAt: 300 },
+    { id: 'd', quote: 'another sentence', createdAt: 400 },
+  ]
+  assert.deepEqual({ ...quoteOccurrences(annotations) }, { a: 0, b: 1, c: 2, d: 0 })
+
+  // Same timestamp: the input order is preserved (stable sort), so the record
+  // the host listed first keeps the earlier occurrence.
+  const tieA = { id: 'x', quote: 'tie', createdAt: 500 }
+  const tieB = { id: 'y', quote: 'tie', createdAt: 500 }
+  assert.deepEqual({ ...quoteOccurrences([tieB, tieA]) }, { y: 0, x: 1 })
+})
+
+test('an already anchored older sibling does not push the later annotation onto the first occurrence', () => {
+  // Two annotations of one sentence, rendered twice (segments 0 and 2). The
+  // older one (a) already has a live range, so only the newer one (b) is
+  // relocated. The old code counted occurrences among the MISSING annotations
+  // only, which gave b ordinal 0 and highlighted a's sentence; with the table,
+  // b owns ordinal 1 and lands on the second occurrence.
+  const annotations = [
+    { id: 'a', quote: 'same here', createdAt: 100 },
+    { id: 'b', quote: 'same here', createdAt: 200 },
+  ]
+  const segments = segmentsOf('same here', ' and ', 'same here')
+  const occurrences = quoteOccurrences(annotations)
+  assert.equal(occurrences.a, 0)
+  assert.equal(occurrences.b, 1)
+  assert.deepEqual(find(segments, 'same here', occurrences.a), { start: [0, 0], end: [0, 8] })
+  assert.deepEqual(find(segments, 'same here', occurrences.b), { start: [2, 0], end: [2, 8] })
+})
+
+test('quoteOccurrences normalizes before comparing and tolerates odd input', () => {
+  const occurrences = quoteOccurrences([
+    { id: 'a', quote: 'alpha\n   beta', createdAt: 1 },
+    { id: 'b', quote: 'alpha beta', createdAt: 2 },
+    { id: 'c', quote: null, createdAt: 3 },
+    { id: 'd', quote: '', createdAt: 4 },
+  ])
+  // The two spellings of the same sentence are one quote with two occurrences;
+  // every quote seen for the first time starts at 0.
+  assert.deepEqual({ ...occurrences }, { a: 0, b: 1, c: 0, d: 1 })
+  assert.deepEqual({ ...quoteOccurrences([]) }, {})
+  assert.deepEqual({ ...quoteOccurrences(undefined) }, {})
 })

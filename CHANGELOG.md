@@ -4,6 +4,80 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-06
+
+### Fixed
+
+- **Two annotations on the same sentence could be re-anchored onto the same
+  occurrence.** After a reload, `reanchor` rebuilt the ranges that were lost and
+  kept the per-quote occurrence counter **only over the annotations that had lost
+  their range**. When the older of two annotations on one sentence still had a
+  live range, the newer one was handed occurrence 0 and relocated onto the older
+  one's text; the wrong `Range` was then cached in `store.ranges[<id>]`, so the
+  highlight and the badge stayed on the wrong sentence until the next reload.
+  `jumpTo`'s fallback had the same shape — it always looked for occurrence 0.
+
+  There is now one pure function for the whole question:
+  `quoteOccurrences(annotations)`, inside the `@pure-anchor` block, numbers every
+  annotation of the session by creation order (compared on the whitespace-
+  normalized quote, stable on equal timestamps, and one quote never affects
+  another). `reanchor` builds that table once per pass and looks up each
+  annotation's own ordinal instead of counting among the missing ones; `jumpTo`
+  uses the same ordinal for its fallback instead of a fixed 0.
+
+  Cost: two annotations of one quote now claim the 2nd, 3rd, … occurrence even
+  when the earlier one's message is not loaded, so the later one can stay "source
+  not in view" until its own occurrence renders — where the old counter could
+  park it on the first occurrence that happened to exist. That is the intended
+  trade: a missing highlight comes back on scroll, a highlight on the wrong
+  sentence misleads.
+
+  Verified: the anchoring test extracts the pure function from `client.js` and
+  asserts creation order (two equal quotes → 0 and 1, different quotes
+  independent, ties stable), and a regression test pins the reported case — older
+  annotation already anchored, newer one missing — to the **second** occurrence.
+  33/33 tests pass.
+
+### Added
+
+- **Redeliver a delivered annotation.** Delivery is once per annotation by
+  design, so a delivered one could not be sent again; the only path back to the
+  model was the `annotation` tool. Both the badge popover and the right-sidebar
+  row now offer **重新投递 / Redeliver** on a `delivered` annotation, backed by a
+  new `redeliver` action of the browser API: the record goes back to `pending`,
+  its delivery receipt (`deliveredAt`/`deliveredTurn`) is cleared, `updatedAt` is
+  refreshed, and the response is that session's fresh `{ annotations }` list —
+  the same shape `update` returns. The next message you send carries the block
+  again; injecting stays the `agent/pre-step` listener's job, `redeliver` only
+  changes persisted state. An unknown id fails with
+  `unknown annotation: <id>`, an already pending id is idempotent. The
+  `annotation` tool now reports `revision: 6`.
+
+  Cost: nothing is retracted. The earlier block is still in the session log, so
+  redelivering really does hand that quote and note to the model a second time,
+  and the transcript shows it again.
+
+  A third cost is shared by both changes: their painted result can only be
+  confirmed in a browser. The suite pins the pure ordinal table, the message
+  shape and the persisted status — not where a highlight and a badge land in the
+  transcript (0.5.0 changed that for a repeated quote), not what 【跳回原文】
+  scrolls to, not whether 【重新投递】 appears on a delivered annotation and only
+  there, and not the state flow behind it (delivered → pending → rides the next
+  message → delivered again). Manual checks: two annotations on one sentence keep
+  one highlight each after a reload; a later annotation whose message is not
+  loaded yet appears on its own occurrence once it renders, not on the first;
+  【重新投递】 shows up only on delivered annotations and follows the state flow
+  above.
+
+### Docs
+
+- `README`/`README.en`: the feature list, the popover/panel action lists, the
+  HTTP API table, the limitation about quote re-anchoring (including the
+  drawing-only cost above) and the test counts describe both changes; the roadmap
+  item that proposed redelivery is done.
+
+[0.5.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.4.0...v0.5.0
+
 ## [0.4.0] - 2026-10-05
 
 ### Changed

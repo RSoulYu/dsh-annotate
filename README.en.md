@@ -45,13 +45,14 @@ inside your own bubble — your message itself is returned byte for byte (see
 |---|---|
 | Select to annotate | A small one-button toolbar appears above the selection; it is viewport-clamped and never overlaps the composer or the submit button |
 | Note optional | Empty note = mark the quote only |
-| Read in place | Click the numbered badge next to the quote for a popover with the quote, the note, and jump-to-source / open-in-sidebar / delete |
+| Read in place | Click the numbered badge next to the quote for a popover with the quote, the note, and jump-to-source / open-in-sidebar / redeliver (delivered annotations only) / delete |
 | No DOM surgery | Highlights use the CSS Custom Highlight API; no node is injected into or rewritten inside a rendered message. That is about the DOM — delivery does add the block to the transcript, as its own injected-context message, see [Limitations](#limitations) item 1 |
 | Composer chip | `✎ ×N` in the composer tool row, immediately before Send; rendered only when the session has annotations |
-| Right-sidebar panel | A two-stage right-sidebar tab with edit / delete / jump / clear-delivered / refresh |
+| Right-sidebar panel | A two-stage right-sidebar tab with edit / delete / jump / redeliver / clear-delivered / refresh |
 | Durable | `$DSH_HOME/annotations/annotations.json`, shared across sessions and restarts, outside every workspace |
 | Stable numbering | Panel #3 is `Annotation 3` in the reply |
 | Delivered once | Annotations are marked delivered only once the session log carries the message holding their block, and are never re-sent |
+| Redeliver | A delivered annotation can be put back in the queue from the badge popover or the sidebar row: it rides your next message again. That is a genuine second send — the block already in the log is not retracted |
 | Agent tool | `annotation` with `list` / `resolve` actions, for re-reading after a compaction |
 
 ## Install
@@ -128,16 +129,26 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
    already a logged message, and deleting only removes the annotation record
    with its badge and highlight; (b) **exporting, sharing or copying that session
    carries the quoted text and your annotation notes with it.** The other way
-   round, regenerate/fork *does* show the block to the model again.
+   round, regenerate/fork *does* show the block to the model again — and so does
+   **redeliver**, which deliberately sends a delivered annotation a second time.
 2. **Host-half edits need a restart** (see above).
 3. **Re-anchoring after a reload is quote-based, and now lazy:** a quote whose
    message is not loaded yet is marked “source not in view” in the panel and is
    located automatically once that message renders. The rest still applies. Badges and highlights rely on
    a live `Range`; after a refresh the quote is relocated through a
    whitespace-normalized full-text index, so selections spanning several text
-   nodes and whitespace differences both work. A quote that is no longer in the
+   nodes and whitespace differences both work. When one sentence is annotated
+   twice, each annotation's occurrence is fixed at creation time by
+   `quoteOccurrences` over the whole session (0.5.0) — so an annotation that lost
+   its range goes back to *its own* occurrence even when the older one is still
+   anchored, instead of being shifted onto the first. A quote that is no longer in the
    document at all (for example a message virtualized out of the transcript)
-   still cannot be located — the panel always keeps the full quote.
+   still cannot be located — the panel always keeps the full quote. Both 0.5.0
+   changes also have a drawing side that only a browser can confirm: which
+   occurrence a highlight and a badge land on, where Jump to source scrolls to,
+   and when the Redeliver button appears (delivered annotations only) plus the
+   state flow behind it — the suite pins the pure ordinal table and the message
+   shape, not the drawing.
 4. **Web only.** There is no TUI build.
 5. **Text only.** Text inside images or inside structured tool-call cards cannot
    be selected.
@@ -166,7 +177,7 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 ```sh
 node --check index.js && node --check client.js
-node --test                # 28 tests: delivery, authorization, anchoring
+node --test                # 33 tests: delivery, authorization, anchoring
 ```
 
 Do **not** pass `test/` to the runner. Node 22 resolves a positional argument as a

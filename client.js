@@ -78,6 +78,7 @@ window.__ModuleLoader__.load({
       'panel.edit': '编辑',
       'panel.delete': '删除',
       'panel.clearDelivered': '清空已送达',
+      'panel.redeliver': '重新投递',
       'panel.copy': '复制',
       'panel.copied': '已复制',
       'panel.hint': '批注会在你发送下一条消息时自动随消息发给我，我会按编号逐条回应。',
@@ -87,6 +88,7 @@ window.__ModuleLoader__.load({
       'panel.loading': '加载中…',
       'toast.jumpFailed': '原文不在当前视图中',
       'toast.saveFailed': '保存失败',
+      'toast.redeliverFailed': '重新投递失败',
     }
 
     var EN = {
@@ -115,6 +117,7 @@ window.__ModuleLoader__.load({
       'panel.edit': 'Edit',
       'panel.delete': 'Delete',
       'panel.clearDelivered': 'Clear delivered',
+      'panel.redeliver': 'Redeliver',
       'panel.copy': 'Copy',
       'panel.copied': 'Copied',
       'panel.hint': 'Annotations ride the next message you send; the reply answers them by number.',
@@ -124,6 +127,7 @@ window.__ModuleLoader__.load({
       'panel.loading': 'Loading…',
       'toast.jumpFailed': 'The source text is not in the current view',
       'toast.saveFailed': 'Could not save',
+      'toast.redeliverFailed': 'Could not redeliver',
     }
 
     var t = function (key) {
@@ -436,6 +440,41 @@ window.__ModuleLoader__.load({
         from = at + 1
       }
     }
+
+    /**
+     * Which occurrence (0-based) of its own quote each annotation owns.
+     *
+     * Two annotations of the same sentence must stay on the two places they were
+     * made: the one created first takes the first occurrence, the next one the
+     * second, and so on. The table is built over EVERY annotation of the
+     * session, not only over the ones whose range is still missing — an
+     * annotation that is already anchored has already used up its occurrence,
+     * so counting only the unanchored ones would hand a later annotation
+     * somebody else's spot (the bug this fixes).
+     *
+     * Quotes are compared after {@link normalizeQuote}, so a copy that differs
+     * only in whitespace still counts as the same sentence. Different quotes
+     * never affect each other, and the only annotation of a quote gets 0.
+     *
+     * @param annotations this session's records, in any order.
+     * @returns id → 0-based occurrence ordinal among equal quotes.
+     */
+    function quoteOccurrences(annotations) {
+      var list = Array.isArray(annotations) ? annotations.slice() : []
+      // Stable ascending creation order: equal timestamps keep their input order.
+      list.sort(function (a, b) {
+        return a.createdAt - b.createdAt
+      })
+      var seen = Object.create(null)
+      var occurrences = Object.create(null)
+      list.forEach(function (item) {
+        var key = normalizeQuote(item.quote)
+        var at = seen[key] === undefined ? 0 : seen[key]
+        occurrences[item.id] = at
+        seen[key] = at + 1
+      })
+      return occurrences
+    }
     /* @pure-anchor-end */
 
     /** Ordered text segments of the transcript, skipping this plugin's own UI. */
@@ -487,8 +526,10 @@ window.__ModuleLoader__.load({
      *
      * One index build serves every missing annotation (the old shape walked the
      * whole document once per annotation, which is quadratic on a long
-     * transcript), and equal quotes are spread over their occurrences in
-     * creation order so two annotations of the same sentence stay distinct.
+     * transcript), and every annotation is given its own occurrence ordinal by
+     * {@link quoteOccurrences} — built once over the whole session — so two
+     * annotations of the same sentence land on the two places they were made,
+     * whether or not the earlier one still has a live range.
      */
     function reanchor() {
       var added = 0
@@ -504,13 +545,15 @@ window.__ModuleLoader__.load({
       if (missing.length === 0) return added
       var segments = collectSegments()
       var index = buildAnchorIndex(segments)
-      var used = Object.create(null)
+      // Ordinals come from ALL of this session's annotations: one that is
+      // already anchored occupies its occurrence, so it must not be handed out
+      // again to a later annotation of the same quote.
+      var occurrences = quoteOccurrences(store.annotations)
       missing.slice(0, 200).forEach(function (item) {
         var key = normalizeQuote(item.quote)
-        var occurrence = used[key] === undefined ? 0 : used[key]
-        var match = locateQuote(index, key, occurrence)
+        var wanted = occurrences[item.id]
+        var match = locateQuote(index, key, wanted === undefined ? 0 : wanted)
         if (match === null) return
-        used[key] = occurrence + 1
         var range = rangeOfMatch(segments, match)
         if (range !== null) {
           store.ranges[item.id] = range
@@ -602,7 +645,12 @@ window.__ModuleLoader__.load({
       var rect = rangeRect(annotation.id)
       var range = store.ranges[annotation.id]
       if (rect === null || range === undefined) {
-        range = findQuoteRange(annotation.quote, 0)
+        // Fall back to THIS annotation's own occurrence, not the first one: with
+        // two annotations of the same sentence, always occurrence 0 would jump
+        // the second one to the first one's text.
+        var occurrences = quoteOccurrences(store.annotations)
+        var wanted = occurrences[annotation.id]
+        range = findQuoteRange(annotation.quote, wanted === undefined ? 0 : wanted)
         if (range === null) {
           showToast(tr('toast.jumpFailed'))
           return
@@ -1181,6 +1229,21 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * Put one already-delivered annotation back in the queue.
+     *
+     * The host only flips the persisted status; the block rides the next message
+     * of the session again. `mutate` applies the returned session list, so the
+     * row turns back into 待发送 — and since a pending annotation restarts the
+     * poller, it follows the host's delivery confirmation on its own. A failure
+     * is reported instead of swallowed.
+     */
+    function redeliverAnnotation(annotation) {
+      mutate({ action: 'redeliver', id: annotation.id, sessionId: store.sessionId }).catch(function () {
+        showToast(tr('toast.redeliverFailed'))
+      })
+    }
+
     function AnnotationRow(props) {
       var annotation = props.annotation
       var number = props.number
@@ -1272,6 +1335,12 @@ window.__ModuleLoader__.load({
                   title: tr('panel.unanchoredHint'),
                 }, tr('panel.unanchored')),
             smallButton(tr('panel.jump'), guard('jump to source', function () { jumpTo(annotation) })),
+            annotation.status === 'delivered'
+              ? smallButton(
+                  tr('panel.redeliver'),
+                  guard('redeliver annotation', function () { redeliverAnnotation(annotation) }),
+                )
+              : null,
             smallButton(tr('panel.edit'), function () {
               setDraft(annotation.note)
               setEditing(!editing)
@@ -1430,6 +1499,12 @@ window.__ModuleLoader__.load({
           { style: { display: 'flex', gap: '6px' } },
           smallButton(tr('panel.jump'), guard('jump to source', function () { jumpTo(annotation) })),
           smallButton(tr('panel.openSidebar'), guard('open sidebar', function () { openSidebar(annotation.id) })),
+          annotation.status === 'delivered'
+            ? smallButton(
+                tr('panel.redeliver'),
+                guard('redeliver annotation', function () { redeliverAnnotation(annotation) }),
+              )
+            : null,
           smallButton(tr('panel.delete'), guard('delete annotation', function () {
             mutate({ action: 'delete', id: annotation.id, sessionId: store.sessionId }).catch(function () {})
           }), 'danger'),

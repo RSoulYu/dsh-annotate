@@ -13,12 +13,19 @@
 import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
 /** Build the fake plugin context, capturing what the plugin registers. */
 function fakeContext() {
-  const captured = { events: new Map(), tools: [], effects: 0 }
+  const captured = { events: new Map(), tools: [], effects: 0, routes: [] }
+  const webServer = {
+    register(route) {
+      captured.routes.push(route)
+      return () => {}
+    },
+  }
   const ctx = {
     logger: { warn() {}, info() {} },
     on(name, handler) {
@@ -31,9 +38,11 @@ function fakeContext() {
       return typeof dispose === 'function' ? dispose : () => {}
     },
     inject(_names, callback) {
-      // The webServer route is exercised over real HTTP elsewhere.
+      // The browser route is driven directly through `callApi`; the sidebar /
+      // webServer services hand back this fake wherever they are read.
       callback({
-        reflect: { get: () => undefined },
+        webServer,
+        reflect: { get: (name) => (name === 'webServer' ? webServer : undefined) },
         effect: ctx.effect,
       })
       return () => {}
@@ -117,6 +126,35 @@ async function storedById(home) {
   return new Map(stored.annotations.map((item) => [item.id, item]))
 }
 
+/**
+ * Drive the plugin's HTTP route the way the browser half does.
+ *
+ * The route is registered through `ctx.inject(['webServer'])`, so the fake
+ * context captures the handler: the request still goes through the
+ * authorization fence and `readJsonBody`, and nothing needs a live server.
+ */
+async function callApi(captured, body) {
+  const route = captured.routes[0]
+  assert.equal(typeof route?.handler, 'function', 'the plugin registers the browser API route')
+  assert.equal(route.path, '/plugins/dsh-annotate/api')
+  const request = Readable.from([Buffer.from(JSON.stringify(body), 'utf8')])
+  request.method = 'POST'
+  request.headers = { host: '127.0.0.1:3080', 'x-dsh-annotation': '1' }
+  const response = {
+    status: 0,
+    payload: undefined,
+    writeHead(status) {
+      this.status = status
+      return this
+    },
+    end(text) {
+      this.payload = JSON.parse(text)
+    },
+  }
+  await route.handler(request, response)
+  return response
+}
+
 function record(overrides) {
   return {
     id: overrides.id,
@@ -127,6 +165,8 @@ function record(overrides) {
     origin: 'assistant',
     createdAt: overrides.createdAt ?? Date.now(),
     updatedAt: overrides.createdAt ?? Date.now(),
+    deliveredAt: overrides.deliveredAt,
+    deliveredTurn: overrides.deliveredTurn,
   }
 }
 
@@ -367,4 +407,89 @@ test('session ids resolve through either agent shape', async () => {
     assert.equal(decision.messages.length, 2)
     assert.match(blockTextOf(decision), /嵌套形态/)
   })
+})
+
+test('redeliver puts a delivered annotation back in the pending queue', async () => {
+  const createdAt = Date.now() - 5000
+  await withPlugin(
+    [
+      record({ id: 'a1', quote: '已经送过', status: 'delivered', createdAt, deliveredAt: createdAt + 1, deliveredTurn: 3 }),
+      record({ id: 'a2', quote: '还是新的', createdAt: createdAt + 2 }),
+    ],
+    async ({ home, captured }) => {
+      assert.deepEqual(
+        (await storedById(home)).get('a1').deliveredTurn,
+        3,
+        'the seeded record carries a delivery receipt',
+      )
+
+      const response = await callApi(captured, { action: 'redeliver', id: 'a1' })
+      assert.equal(response.status, 200)
+      assert.equal(response.payload.ok, true)
+      const back = response.payload.annotations.find((item) => item.id === 'a1')
+      assert.equal(back.status, 'pending')
+      assert.equal(back.deliveredAt, undefined, 'the delivery receipt is cleared, not just hidden')
+      assert.equal(
+        response.payload.annotations.find((item) => item.id === 'a2').status,
+        'pending',
+        'the whole session list comes back, like update does',
+      )
+
+      const persisted = (await storedById(home)).get('a1')
+      assert.equal(persisted.status, 'pending')
+      assert.equal('deliveredAt' in persisted, false)
+      assert.equal('deliveredTurn' in persisted, false)
+      assert.ok(persisted.updatedAt >= persisted.createdAt)
+
+      // Idempotent: an already pending id comes back pending instead of failing.
+      const again = await callApi(captured, { action: 'redeliver', id: 'a1' })
+      assert.equal(again.status, 200)
+      assert.equal(again.payload.annotations.find((item) => item.id === 'a1').status, 'pending')
+
+      // Unknown ids are reported the way the other actions report them.
+      const missing = await callApi(captured, { action: 'redeliver', id: 'nope' })
+      assert.equal(missing.status, 400)
+      assert.equal(missing.payload.ok, false)
+      assert.equal(missing.payload.error, 'unknown annotation: nope')
+    },
+  )
+})
+
+test('a redelivered annotation rides the next message again', async () => {
+  await withPlugin(
+    [record({ id: 'a1', quote: '再送一次', note: '重投', status: 'delivered', deliveredAt: Date.now(), deliveredTurn: 2 })],
+    async ({ home, captured }) => {
+      const handler = captured.events.get('agent/pre-step')
+
+      // Delivered: it stays out of the way on its own.
+      const quiet = await handler(
+        { agent: { id: 'session-alpha' }, turn: 8, step: 1, messages: [] },
+        async () => userStep('先问一句'),
+      )
+      assert.equal(quiet.messages.length, 1, 'a delivered annotation is not re-sent by itself')
+      assert.equal((await storedById(home)).get('a1').status, 'delivered')
+
+      const response = await callApi(captured, { action: 'redeliver', id: 'a1' })
+      assert.equal(response.status, 200)
+      assert.equal(response.payload.annotations.find((item) => item.id === 'a1').status, 'pending')
+
+      const decision = await handler(
+        { agent: { id: 'session-alpha' }, turn: 9, step: 1, messages: [] },
+        async () => userStep('再问一句'),
+      )
+      assert.equal(decision.messages.length, 2, 'the redelivered annotation rides the next message')
+      assert.match(blockTextOf(decision), /再送一次/)
+      assert.match(blockTextOf(decision), /重投/)
+      assert.equal(
+        (await storedById(home)).get('a1').status,
+        'pending',
+        'injection alone is still not delivery',
+      )
+
+      await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(decision))
+      const final = (await storedById(home)).get('a1')
+      assert.equal(final.status, 'delivered', 'the receipt flips it back to delivered')
+      assert.equal(final.deliveredTurn, 9)
+    },
+  )
 })
