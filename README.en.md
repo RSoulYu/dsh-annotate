@@ -53,6 +53,7 @@ inside your own bubble — your message itself is returned byte for byte (see
 | Stable numbering | Panel #3 is `Annotation 3` in the reply |
 | Delivered once | Annotations are marked delivered only once the session log carries the message holding their block, and are never re-sent |
 | Redeliver | A delivered annotation can be put back in the queue from the badge popover or the sidebar row: it rides your next message again. That is a genuine second send — the block already in the log is not retracted |
+| Repeated quotes stay put | Which occurrence of the quote an annotation was made on is captured from the live selection when the editor opens and persisted with the record (0.6.0). Re-anchoring and Jump to source use that value, so annotating the same spot twice keeps both marks on that one spot; only records without the field fall back to creation order |
 | Agent tool | `annotation` with `list` / `resolve` actions, for re-reading after a compaction |
 
 ## Install
@@ -96,7 +97,9 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
   restart; the agent can re-read them on demand.
 - **Zero footprint when unused.** No annotations, no UI.
 - **Survives a reload.** Quotes are re-located through a whitespace-normalized
-  index, across node boundaries, in one pass over the document.
+  index, across node boundaries, in one pass over the document; each annotation
+  remembers the occurrence it was made on, so two annotations of one quote keep
+  their own spots.
 - **Fenced API.** Loopback `Host` plus a per-boot token that only the pages this
   process served ever see.
 
@@ -137,18 +140,33 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
    located automatically once that message renders. The rest still applies. Badges and highlights rely on
    a live `Range`; after a refresh the quote is relocated through a
    whitespace-normalized full-text index, so selections spanning several text
-   nodes and whitespace differences both work. When one sentence is annotated
-   twice, each annotation's occurrence is fixed at creation time by
-   `quoteOccurrences` over the whole session (0.5.0) — so an annotation that lost
-   its range goes back to *its own* occurrence even when the older one is still
-   anchored, instead of being shifted onto the first. A quote that is no longer in the
+   nodes and whitespace differences both work. When one quote is annotated more
+   than once, **the occurrence each annotation was made on is captured at
+   creation time and persisted with the record** (0.6.0): the editor resolves “how
+   many occurrences lie entirely before this selection” from the live `Range`, the
+   value travels with the `create` request, the host stores it, and re-anchoring
+   and Jump to source prefer it. So annotating the *same* spot twice keeps both
+   annotations on that spot (both say 0), while two annotations made on two
+   different occurrences stay 0 and 1 — the 0.5.0 fix, unchanged. Records without
+   the field (written by 0.5.0 and older) fall back to a creation-order table
+   built **among those legacy records alone**: a record that knows its own
+   occurrence neither consumes a fallback ordinal nor pushes an older record
+   somewhere else. That fallback also has an **opposite** cost in a session that
+   mixes versions: with the quote present **twice**, a legacy record (no
+   `occurrence` field) that was made on the **second** occurrence is handed
+   ordinal 0 by the fallback table and silently lands on the **first** one —
+   0.5.0 behaved the same way with the same input, so this is not a 0.6.0
+   regression; deleting that annotation and re-creating it on the spot stores the
+   true ordinal. When the value cannot be resolved at creation (the node the
+   selection pointed at has been replaced by a re-render, say) nothing is stored
+   — a guessed ordinal is never persisted. A quote that is no longer in the
    document at all (for example a message virtualized out of the transcript)
    still cannot be located — the panel always keeps the full quote. Both 0.5.0
-   changes also have a drawing side that only a browser can confirm: which
-   occurrence a highlight and a badge land on, where Jump to source scrolls to,
-   and when the Redeliver button appears (delivered annotations only) plus the
-   state flow behind it — the suite pins the pure ordinal table and the message
-   shape, not the drawing.
+   changes and this one have a drawing side that only a browser can confirm:
+   which occurrence a highlight and a badge land on, where Jump to source scrolls
+   to, and when the Redeliver button appears (delivered annotations only) plus the
+   state flow behind it — the suite pins the pure functions and the persisted
+   field, not the drawing.
 4. **Web only.** There is no TUI build.
 5. **Text only.** Text inside images or inside structured tool-call cards cannot
    be selected.
@@ -157,9 +175,11 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
    busy and your message is queued, the block rides that queued message when it is
    processed; if the message is never processed, the annotations stay "pending".
    Delivery is confirmed by the session log: `agent/pre-step` returns before the
-   loop's abort check and before `prepareRequest`, so pressing stop (or a request
-   that fails while being prepared) means the message is never appended, the
-   annotations go back to "pending" and ride your next message. The cost is one
+   loop's abort check and before `prepareRequest`, so an abort (or a request that
+   fails while being prepared) **before the block reaches the log** means the
+   message is never appended, the annotations go back to "pending" and ride your
+   next message. Once the block *is* in the log, a later abort does not undo it:
+   the record stays delivered, and a regression test pins that. The cost is one
    narrow duplicate window — if the process exits after the block reached the log
    but before the "delivered" status was written, those annotations still read as
    pending next boot and are sent once more.
@@ -177,7 +197,7 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 
 ```sh
 node --check index.js && node --check client.js
-node --test                # 33 tests: delivery, authorization, anchoring
+node --test                # 46 tests: delivery, authorization, anchoring
 ```
 
 Do **not** pass `test/` to the runner. Node 22 resolves a positional argument as a
@@ -186,7 +206,9 @@ directory. With no arguments every version in the CI matrix discovers `test/`.
 
 The anchoring tests exercise the shipped code: the core is marked `@pure-anchor`
 inside `client.js` and the test evaluates that exact slice, so there is no second
-copy of the algorithm to drift.
+copy of the algorithm to drift. That slice does not touch the DOM; mapping the
+live selection onto it (`segmentPositionOf` / `occurrenceOfRange`) is the only
+part of the creation-time capture that a unit test cannot reach.
 
 The host half imports only `node:*` builtins — a workspace-installed bundle
 cannot resolve `@deepseek-ai/*` packages at runtime. The browser half only

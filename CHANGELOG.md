@@ -4,6 +4,89 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-06
+
+### Fixed
+
+- **Two annotations on the same spot of a quote that appears once: the second one
+  could never anchor.** 0.5.0 made re-anchoring give every annotation its own
+  occurrence, computed from creation order over equal quotes
+  (`quoteOccurrences`). That is right when the two annotations were made on two
+  different occurrences — but it invents a wrong ordinal when they were made on
+  the *same* one: with the quote present once, the second annotation was handed
+  occurrence 1, `locateQuote` found nothing there, and the row kept reading
+  「原文未在视图中」/ "source not in view" for good — there is no second occurrence
+  to scroll to.
+
+  The occurrence is now **captured at creation time and persisted with the
+  record**. The browser half still holds the live selection `Range` at that
+  moment, which is the only place the truth exists: the editor captures it as it
+  opens, while the selection is still live and before a streaming re-render can
+  detach what the Range points at, `occurrenceAt(index, quote, position)` (new,
+  inside the `@pure-anchor` block) answers "how many occurrences lie entirely
+  before this (segment, offset) position", and `saveEditor` sends it as
+  `occurrence` (a non-negative integer) in the `create` request — recomputing it
+  once before the editor closes when the early capture could not resolve, and
+  sending no field at all when the position stays unknown, so the legacy fallback
+  takes over instead of a guessed ordinal being pinned to the record. The host
+  half keeps the value through all four links — `normalizeRecord` accepts an
+  optional `occurrence` and keeps only a finite non-negative integer (a string, a
+  fraction, a negative, `NaN` or an object becomes `undefined`, and nothing
+  throws), `AnnotationStore.create` and `case 'create'` pass it through, and
+  `toClient` returns it — so a reload still knows where each annotation was made.
+
+  `reanchor` and `jumpTo` now locate each annotation at the occurrence stored on
+  its own record, and fall back to the creation-order table only for records that
+  do not carry one (everything written by 0.5.0 and older). The fallback table is
+  built among those legacy records alone: a record that knows its own occurrence
+  must not consume an ordinal and push an older record somewhere else. Both
+  reported scenarios are pinned by tests: one occurrence, annotated twice at the
+  same spot → both records say 0 and both anchor there; two occurrences, each
+  annotated once → 0 and 1, each on its own place (the 0.5.0 fix, unchanged).
+
+  Cost: records written before 0.6.0 keep the old creation-order guess, so a
+  0.5.0 session whose second annotation landed on an already-annotated single
+  occurrence still reads "source not in view" until that annotation is re-created.
+  The same guess fails in the other direction as soon as one session mixes
+  versions: with the quote present **twice**, a legacy record (no `occurrence`
+  field) that was made on the **second** occurrence is handed ordinal 0 by the
+  fallback table and silently lands on the **first** one — 0.5.0 did the same with
+  the same input, so this is the residual cost of not having captured the value
+  back then, not a 0.6.0 regression（0.5.0 同输入亦如此，非本次回归）. Deleting that
+  annotation and re-creating it on the spot stores the true ordinal and pins it.
+  代价：**浏览器绘制面无法自动验证** —— 高亮与徽标最终落在哪一处、【跳回原文】
+  滚到哪，只能在浏览器里人工确认；单测钉住的是纯函数与持久化字段，不是绘制。
+
+### Added
+
+- **A regression test that pins "the log confirms; the abort does not
+  un-deliver".** `test/host.test.mjs` now drives the whole sequence:
+  `agent/pre-step` injects the block, the log publishes the `user/message` that
+  carries it (the record flips to `delivered`), and then
+  `turn/end { reason: { kind: 'aborted' } }` arrives — the record must still read
+  `delivered`, and the next message must not carry it again. That behaviour was
+  already the design ("delivered" is confirmed by the log, never assumed); it was
+  only described by a narrow-window test plus a comment that read "the stop
+  button aborted the turn before the loop appended the message". The comment
+  conflated two different situations and is now precise: the pending case is the
+  narrow window between `agent/pre-step` returning and the message reaching the
+  log, *not* what pressing stop does in general.
+
+- **Host-half coverage for the new field.** `create` persists the occurrence and
+  hands it back in both projections; a malformed value is dropped without failing
+  the request; a record shaped like a 0.5.0 file (no `occurrence` key at all)
+  still loads, lists and is delivered exactly as before. The `annotation` tool now
+  reports `revision: 7`.
+
+### Docs
+
+- `README`/`README.en`: the feature table, the HTTP `create` payload, the stored
+  JSON shape, the re-anchoring limitation (which now explains the creation-time
+  capture, the legacy fallback and the drawing-only cost) and the test count
+  (33 → 46).
+
+[0.6.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.5.0...v0.6.0
+
 ## [0.5.0] - 2026-10-06
 
 ### Fixed

@@ -368,7 +368,6 @@ window.__ModuleLoader__.load({
       })
     }
 
-    /** Find the nth occurrence of a quote inside one text node (best effort). */
     /* @pure-anchor
      *
      * Quote anchoring core. Kept free of any DOM reference so it can be
@@ -475,6 +474,91 @@ window.__ModuleLoader__.load({
       })
       return occurrences
     }
+
+    /**
+     * Which occurrence (0-based) of a quote one position belongs to.
+     *
+     * This is what the creation flow asks: the selection start is the one
+     * moment the place the user meant is known for certain, and the answer is
+     * stored with the annotation so re-anchoring never has to guess it again.
+     *
+     * The rule is "how many occurrences lie entirely before `position`": a
+     * position at or inside an occurrence answers with that occurrence's own
+     * ordinal, and a position past the end of the last one answers with the
+     * total number of occurrences (a caller looking for a locatable ordinal
+     * then simply gets a miss, exactly like a quote that is not there at all).
+     * Because the comparison is on (segment, offset) — not on the normalized
+     * text — a position that falls in whitespace the normalization collapsed
+     * behaves like the following character, so a selection that starts on a
+     * leading space still lands on the occurrence it was made on.
+     *
+     * @param index result of {@link buildAnchorIndex}.
+     * @param quote the quote, normalized or not ({@link normalizeQuote} is idempotent).
+     * @param position `{ s, o }` point in the same coordinates {@link locateQuote} matches.
+     * @returns 0-based ordinal; 0 for an empty, malformed or absent quote.
+     */
+    function occurrenceAt(index, quote, position) {
+      var wanted = normalizeQuote(quote)
+      if (wanted.length === 0 || position === null || position === undefined) return 0
+      var seen = 0
+      for (;;) {
+        var match = locateQuote(index, wanted, seen)
+        if (match === null) return seen
+        // The occurrence is still "not over" at `position`: either it contains
+        // it or it starts after it. Either way the answer is `seen`.
+        if (match.end.s > position.s || (match.end.s === position.s && match.end.o >= position.o)) return seen
+        seen += 1
+      }
+    }
+
+    /**
+     * The occurrence an annotation captured when it was created, or null.
+     *
+     * The field is optional: records written before 0.6.0 do not carry it, and
+     * the host half drops anything malformed. Only a finite, non-negative
+     * integer counts — a string, a fraction, a negative or `NaN` must fall back
+     * to {@link quoteOccurrences} instead of being trusted as a place.
+     *
+     * @param annotation one client-side record.
+     * @returns the stored 0-based ordinal, or null when it must be inferred.
+     */
+    function storedOccurrence(annotation) {
+      var value = annotation === null || annotation === undefined ? undefined : annotation.occurrence
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || Math.floor(value) !== value) return null
+      return value
+    }
+
+    /**
+     * The occurrence each annotation must be located at.
+     *
+     * A record that captured its own occurrence at creation (0.6.0) is believed:
+     * it is the place the user actually selected, so two annotations of one
+     * quote made on the same spot both say 0 and both land there, instead of the
+     * second one claiming an occurrence that may not exist.
+     *
+     * Only the records WITHOUT that value are numbered the old way (creation
+     * order over equal quotes), and the fallback table is built among those
+     * records alone: a record that knows its own occurrence must not use up an
+     * ordinal there and push an older record onto the wrong place.
+     *
+     * @param annotations this session's records, in any order.
+     * @returns id → 0-based occurrence ordinal.
+     */
+    function wantedOccurrences(annotations) {
+      var list = Array.isArray(annotations) ? annotations : []
+      var wanted = Object.create(null)
+      var legacy = []
+      list.forEach(function (item) {
+        var stored = storedOccurrence(item)
+        if (stored === null) legacy.push(item)
+        else wanted[item.id] = stored
+      })
+      var fallback = quoteOccurrences(legacy)
+      Object.keys(fallback).forEach(function (id) {
+        if (wanted[id] === undefined) wanted[id] = fallback[id]
+      })
+      return wanted
+    }
     /* @pure-anchor-end */
 
     /** Ordered text segments of the transcript, skipping this plugin's own UI. */
@@ -522,14 +606,71 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The `{ s, o }` coordinate of one DOM point, in the coordinates
+     * {@link buildAnchorIndex} uses.
+     *
+     * The start of a selection is usually a text node plus an offset; an element
+     * container means "between its children" (a selection that begins on a
+     * `<strong>` edge, for example), which is the first collected text node at
+     * or after that boundary. Returns null when the point is not inside any
+     * collected text segment — the caller then has no truth to record.
+     */
+    function segmentPositionOf(segments, node, offset) {
+      if (node === null || node === undefined) return null
+      if (node.nodeType === Node.TEXT_NODE) {
+        for (var i = 0; i < segments.length; i += 1) {
+          if (segments[i].node === node) return { s: i, o: offset }
+        }
+        return null
+      }
+      var children = node.childNodes
+      var boundary = offset < children.length ? children[offset] : null
+      for (var j = 0; j < segments.length; j += 1) {
+        var candidate = segments[j].node
+        if (boundary === null) {
+          if ((node.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0) return { s: j, o: 0 }
+          continue
+        }
+        if (
+          boundary.contains(candidate) ||
+          (boundary.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+        ) {
+          return { s: j, o: 0 }
+        }
+      }
+      return null
+    }
+
+    /**
+     * The 0-based occurrence of `quote` that one selection starts on, or null
+     * when that cannot be answered.
+     *
+     * This is the DOM-touching half of the creation-time capture, and it is
+     * called while the selection is still live. Null means "no truth available"
+     * — the range is gone, or it starts outside the collected transcript text
+     * (our own UI, the composer, a node a re-render replaced) — and the caller
+     * then stores no occurrence at all, so the legacy creation-order fallback
+     * takes over instead of a guessed ordinal being pinned to the record.
+     */
+    function occurrenceOfRange(quote, range) {
+      if (range === null || range === undefined || range.startContainer === undefined) return null
+      var segments = collectSegments()
+      var index = buildAnchorIndex(segments)
+      var position = segmentPositionOf(segments, range.startContainer, range.startOffset)
+      if (position === null) return null
+      return occurrenceAt(index, quote, position)
+    }
+
+    /**
      * Rebuild ranges that were lost (page reload).
      *
      * One index build serves every missing annotation (the old shape walked the
      * whole document once per annotation, which is quadratic on a long
-     * transcript), and every annotation is given its own occurrence ordinal by
-     * {@link quoteOccurrences} — built once over the whole session — so two
-     * annotations of the same sentence land on the two places they were made,
-     * whether or not the earlier one still has a live range.
+     * transcript), and every annotation is located at {@link wantedOccurrences}'
+     * ordinal — the occurrence captured at creation, or the creation-order table
+     * for records that predate it — so two annotations of the same sentence land
+     * on the two places they were made, whether or not the earlier one still has
+     * a live range.
      */
     function reanchor() {
       var added = 0
@@ -545,14 +686,15 @@ window.__ModuleLoader__.load({
       if (missing.length === 0) return added
       var segments = collectSegments()
       var index = buildAnchorIndex(segments)
-      // Ordinals come from ALL of this session's annotations: one that is
-      // already anchored occupies its occurrence, so it must not be handed out
-      // again to a later annotation of the same quote.
-      var occurrences = quoteOccurrences(store.annotations)
+      // The ordinal comes from the record itself when it captured one at
+      // creation (0.6.0); only records without it are numbered among themselves.
+      // An annotation that is already anchored occupies its occurrence either
+      // way, so it must not be handed out again to a later annotation.
+      var wanted = wantedOccurrences(store.annotations)
       missing.slice(0, 200).forEach(function (item) {
         var key = normalizeQuote(item.quote)
-        var wanted = occurrences[item.id]
-        var match = locateQuote(index, key, wanted === undefined ? 0 : wanted)
+        var ordinal = wanted[item.id]
+        var match = locateQuote(index, key, ordinal === undefined ? 0 : ordinal)
         if (match === null) return
         var range = rangeOfMatch(segments, match)
         if (range !== null) {
@@ -645,12 +787,12 @@ window.__ModuleLoader__.load({
       var rect = rangeRect(annotation.id)
       var range = store.ranges[annotation.id]
       if (rect === null || range === undefined) {
-        // Fall back to THIS annotation's own occurrence, not the first one: with
-        // two annotations of the same sentence, always occurrence 0 would jump
-        // the second one to the first one's text.
-        var occurrences = quoteOccurrences(store.annotations)
-        var wanted = occurrences[annotation.id]
-        range = findQuoteRange(annotation.quote, wanted === undefined ? 0 : wanted)
+        // Fall back to THIS annotation's own occurrence (the one captured at
+        // creation, or the creation-order table for older records), not the
+        // first one: with two annotations of the same sentence, always
+        // occurrence 0 would jump the second one to the first one's text.
+        var ordinal = wantedOccurrences(store.annotations)[annotation.id]
+        range = findQuoteRange(annotation.quote, ordinal === undefined ? 0 : ordinal)
         if (range === null) {
           showToast(tr('toast.jumpFailed'))
           return
@@ -805,12 +947,20 @@ window.__ModuleLoader__.load({
 
     function openEditor(context) {
       if (context === null || context === undefined) return
+      var quote = typeof context.quote === 'string' ? context.quote : ''
+      var range = context.range ?? null
       store.editor = {
-        quote: typeof context.quote === 'string' ? context.quote : '',
-        range: context.range ?? null,
+        quote: quote,
+        range: range,
         origin: context.origin === 'user' ? 'user' : 'assistant',
         geometry: editorGeometry(context.rect),
         value: '',
+        // Capture which occurrence of the quote this selection is while it is
+        // still live: a streaming re-render between opening this editor and
+        // saving it can detach the nodes the Range points at, and the position
+        // is not answerable any more. null = unknown, and then no occurrence is
+        // persisted for the record.
+        occurrence: occurrenceOfRange(quote, range),
       }
       store.toolbar = null
       emit()
@@ -828,12 +978,29 @@ window.__ModuleLoader__.load({
       var range = editor.range
       var quote = editor.quote
       var origin = editor.origin
+      // The occurrence to persist: the one captured when the editor opened (the
+      // live selection is the one moment the place is known for certain), plus a
+      // last chance here for the cases where that capture could not resolve and
+      // the retained Range happens to still be live. A value that is not a finite
+      // non-negative integer is sent as nothing at all, so the client half falls
+      // back to the legacy creation-order table and no guessed ordinal is ever
+      // pinned to the record. Computed BEFORE the editor closes, while the
+      // selection is still available.
+      var occurrence = editor.occurrence
+      if (occurrence === null || occurrence === undefined) occurrence = occurrenceOfRange(quote, range)
+      var stored = Number.isInteger(occurrence) && occurrence >= 0 ? occurrence : undefined
       closeEditor()
       if (store.sessionId === null) return
       mutate({
         action: 'create',
         sessionId: store.sessionId,
-        annotation: { sessionId: store.sessionId, quote: quote, note: note, origin: origin },
+        annotation: {
+          sessionId: store.sessionId,
+          quote: quote,
+          note: note,
+          origin: origin,
+          occurrence: stored,
+        },
       }).then(function (body) {
         var created = body.annotation
         if (created !== undefined && range !== null) {

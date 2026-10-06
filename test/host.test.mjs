@@ -298,7 +298,12 @@ test('a turn that ends without the block re-delivers it on the next message', as
     )
     assert.equal(sameTurn.messages.length, 1, 'no duplicate block while one is in flight')
 
-    // The stop button aborted the turn before the loop appended the message.
+    // This turn ended BEFORE the loop appended the block — the narrow window
+    // between `agent/pre-step` returning and the message reaching the log (an
+    // abort right there, or a request that fails while `prepareRequest` runs).
+    // That is what leaves the record pending. Pressing stop AFTER the block is
+    // already in the log is a different case: nothing un-delivers it, which the
+    // next test pins.
     emitSession(captured, 'session-alpha', 'turn/end', { turn: 4, reason: { kind: 'aborted' } })
     assert.equal((await storedById(home)).get('a1').status, 'pending', 'an aborted turn delivers nothing')
 
@@ -311,6 +316,36 @@ test('a turn that ends without the block re-delivers it on the next message', as
 
     await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(second))
     assert.equal((await storedById(home)).get('a1').status, 'delivered')
+  })
+})
+
+test('a delivered annotation stays delivered when the turn is aborted', async () => {
+  await withPlugin([record({ id: 'a1', quote: '已经送到的原文' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      async () => userStep('问题'),
+    )
+    assert.equal(decision.messages.length, 2)
+
+    // The loop appended the block after `agent/pre-step` returned, so the log
+    // carries it and the record is delivered.
+    await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(decision))
+    assert.equal((await storedById(home)).get('a1').status, 'delivered')
+
+    // The user then presses stop. `turn/end` only drops an UNCONFIRMED receipt:
+    // the retry path exists for a block that never landed, so it must not undo a
+    // delivery the log already proves.
+    await emitSession(captured, 'session-alpha', 'turn/end', { turn: 4, reason: { kind: 'aborted' } })
+    const persisted = (await storedById(home)).get('a1')
+    assert.equal(persisted.status, 'delivered', 'an abort after the append must not un-deliver the block')
+    assert.equal(persisted.deliveredTurn, 4)
+
+    const next = await handler(
+      { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: [] },
+      async () => userStep('再问一次'),
+    )
+    assert.equal(next.messages.length, 1, 'and it does not ride the next message again')
   })
 })
 
@@ -492,4 +527,97 @@ test('a redelivered annotation rides the next message again', async () => {
       assert.equal(final.deliveredTurn, 9)
     },
   )
+})
+
+test('create persists the occurrence the browser captured', async () => {
+  await withPlugin([], async ({ home, captured }) => {
+    const create = (note) =>
+      callApi(captured, {
+        action: 'create',
+        sessionId: 'session-alpha',
+        annotation: { sessionId: 'session-alpha', quote: '同一处原文', note, origin: 'assistant', occurrence: 0 },
+      })
+
+    const first = await create('第一条')
+    assert.equal(first.status, 200)
+    assert.equal(first.payload.ok, true)
+    assert.equal(first.payload.annotation.occurrence, 0, 'toClient hands the value back with the new record')
+
+    // The reported case: the quote appears once and the user annotates that one
+    // spot twice. Both records carry 0, so both anchor to it.
+    const second = await create('第二条')
+    assert.equal(second.payload.annotation.occurrence, 0, 'the same spot stays occurrence 0')
+    assert.equal((await storedById(home)).get(second.payload.annotation.id).occurrence, 0, 'and it is persisted')
+
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    assert.deepEqual(
+      listed.payload.annotations.map((item) => item.occurrence),
+      [0, 0],
+      'the list projection carries it, so a reload re-anchors from the captured value',
+    )
+  })
+})
+
+test('only a finite non-negative integer occurrence is kept', async () => {
+  await withPlugin([], async ({ home, captured }) => {
+    // JSON cannot carry NaN/Infinity, so those two arrive as null; the point of
+    // the list is that no malformed value is trusted or makes the request fail.
+    const cases = [
+      ['string', '1'],
+      ['fraction', 1.5],
+      ['negative', -1],
+      ['nan', Number.NaN],
+      ['infinite', Number.POSITIVE_INFINITY],
+      ['null', null],
+      ['object', { at: 0 }],
+      ['array', [0]],
+      ['boolean', true],
+    ]
+    for (const [label, occurrence] of cases) {
+      const response = await callApi(captured, {
+        action: 'create',
+        sessionId: 'session-alpha',
+        annotation: { sessionId: 'session-alpha', quote: label, occurrence },
+      })
+      assert.equal(response.status, 200, `${label} must not fail the request`)
+      assert.equal(response.payload.annotation.occurrence, undefined, `${label} is dropped`)
+      assert.equal(
+        'occurrence' in (await storedById(home)).get(response.payload.annotation.id),
+        false,
+        `${label} is not persisted`,
+      )
+    }
+
+    const good = await callApi(captured, {
+      action: 'create',
+      sessionId: 'session-alpha',
+      annotation: { sessionId: 'session-alpha', quote: '合法值', occurrence: 3 },
+    })
+    assert.equal(good.payload.annotation.occurrence, 3, 'a real ordinal still round-trips')
+  })
+})
+
+test('a record written before the field existed loads, lists and delivers as before', async () => {
+  // This fixture is a 0.5.0 file: no `occurrence` key anywhere.
+  await withPlugin([record({ id: 'a1', quote: '老记录' })], async ({ home, captured }) => {
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    assert.equal(listed.payload.annotations.length, 1)
+    assert.equal('occurrence' in listed.payload.annotations[0], false, 'no invented field in the projection')
+    assert.equal('occurrence' in (await storedById(home)).get('a1'), false, 'and none written to disk')
+
+    const tool = captured.tools[0]
+    const read = await tool.execute({ action: 'list' }, { agent: { id: 'session-alpha' } })
+    assert.equal(read.annotations.length, 1)
+    assert.equal(read.annotations[0].quote, '老记录')
+
+    const handler = captured.events.get('agent/pre-step')
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 1, step: 1, messages: [] },
+      async () => userStep('问题'),
+    )
+    assert.equal(decision.messages.length, 2, 'an old record still rides the next message')
+    assert.match(blockTextOf(decision), /老记录/)
+    await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(decision))
+    assert.equal((await storedById(home)).get('a1').status, 'delivered')
+  })
 })

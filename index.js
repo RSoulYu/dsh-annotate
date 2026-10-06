@@ -57,7 +57,7 @@ export const inject = ['tools']
  * re-activated; the tool reports this value so "which revision is live" is
  * answerable without a restart-and-guess.
  */
-const REVISION = 6
+const REVISION = 7
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
 /**
@@ -97,6 +97,19 @@ function asId(value) {
 }
 
 /**
+ * Keep a client-supplied occurrence only when it is a finite, non-negative
+ * integer.
+ *
+ * The field is optional (records written before 0.6.0 do not carry it) and the
+ * browser is not trusted: a string, a fraction, a negative or `NaN` is dropped
+ * to `undefined` so the client half falls back to its creation-order table
+ * instead of trying to locate a nonsense position. Never throws.
+ */
+function asOccurrence(value) {
+  return Number.isInteger(value) && value >= 0 ? value : undefined
+}
+
+/**
  * Resolve the Session id from an agent handle. The event contract exposes
  * `agent.id`, but the live Agent also carries `agent.session.id`; prefer
  * whichever looks like a session id so a contract change degrades to the
@@ -132,6 +145,7 @@ function normalizeRecord(raw) {
     deliveredAt: Number.isFinite(raw.deliveredAt) ? raw.deliveredAt : undefined,
     deliveredTurn: Number.isFinite(raw.deliveredTurn) ? raw.deliveredTurn : undefined,
     origin: raw.origin === 'user' ? 'user' : 'assistant',
+    occurrence: asOccurrence(raw.occurrence),
   }
 }
 
@@ -230,6 +244,7 @@ class AnnotationStore {
       quote: input.quote,
       note: input.note,
       origin: input.origin,
+      occurrence: input.occurrence,
       status: 'pending',
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -518,6 +533,7 @@ function toClient(record, numbers) {
     note: record.note,
     status: record.status,
     origin: record.origin,
+    occurrence: record.occurrence,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     deliveredAt: record.deliveredAt,
@@ -760,6 +776,7 @@ async function handleApi(store, body, sessionId) {
         quote: asString(input.quote, MAX_QUOTE),
         note: asString(input.note, MAX_NOTE),
         origin: input.origin === 'user' ? 'user' : 'assistant',
+        occurrence: input.occurrence,
       })
       const records = store.list(target)
       const numbers = numbering(records)
