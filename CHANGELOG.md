@@ -4,6 +4,88 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-07
+
+### Fixed
+
+- **An annotation added while the model was still answering was delivered at once,
+  with no message from the user to ride.** `agent/pre-step` fires for *every* step
+  of a turn, and every step used to inject the block, so a fresh annotation was
+  picked up by the very next step of a turn that had already been running —
+  reported live, with the block landing on step 24 of a turn in which the user
+  sent nothing.
+
+  Delivery is now gated on what the step actually carries: the block goes out only
+  when the batch the step **claimed** (`payload.messages`, the array the loop
+  hands to every `agent/pre-step` listener and returns as the enter decision)
+  contains a message whose `source.kind` is `user` — that is, **input attributed
+  to the user**. The criterion is deliberately `source.kind`, and neither `role`
+  nor `step === 1`: `createUserMessage` gives the `user` *role* to the loop's own
+  runtime context and to plugin notices alike (`runtime-context`, `goal`,
+  `tool-jobs`, …), and an automatic continuation round also lands on a step 1, so
+  either test would re-open this exact defect. The verdict comes from the claimed
+  batch rather than from `decision.messages`, which a later listener may have
+  added to; the block is still injected into `decision.messages`. The old
+  `role === 'user'` fallback — which would happily hang the block on a job notice
+  — is gone: with no user-attributed host on the list, nothing is injected and a
+  warning is logged instead.
+
+  "Attributed to the user" is attribution, not the literal keystroke: relaying
+  plugins write `source.kind === 'user'` too — `/plan <text>` steers the text you
+  just typed (claimed by a later step of the same turn), `/goal` re-injects its
+  attachments, agent-teams replays a slash command, and a subagent delegation
+  prompt is `user` in the child session that receives it.
+
+  Cost: an annotation added **while a turn is running** now waits for your next
+  message instead of riding the step the model is already executing. Until then it
+  stays "pending" (the `annotation` tool can still read it on demand), and no
+  non-user step will take it away.
+
+- **A numbered badge could be drawn on top of the composer — and, being
+  clickable, take the click meant for the input box.** The badges live in a fixed,
+  full-viewport layer, so nothing in the page layout stopped them from landing on
+  the composer. `badgeList` now derives the page's vertical occlusion band once
+  per render (`badgeBand` / `badgeOcclusionBand`, both inside the `@pure-anchor`
+  slice) and drops any entry whose **badge box** (`badgeBox`: the 18 px badge at
+  `max(2, rect.top - 9)`) overlaps it. The bottom edge subtracts the composer
+  height the host publishes (`--dsh-composer-height`, read off
+  `[data-conversation-scroll]`, falling back to the host's own `152px` default)
+  from the measured transcript-scroller bottom; the head edge is the scroller's
+  own top. An unreadable source contributes no edge, so nothing is guessed. The
+  coordinates are never adjusted to dodge the band, and the vertical
+  out-of-view filter, the scroll-away/scroll-back behavior and the overlay's
+  pointer-events contract are unchanged.
+
+  Costs, deliberately accepted: (a) an entry whose **badge box** falls inside the
+  band is **not drawn at all** rather than nudged — a badge moved out of the way
+  would read as an annotation that moved — so a quote whose top has scrolled
+  behind the composer (or above the transcript head) loses its badge for that
+  scroll position and can only be reached from the sidebar for the moment; a quote
+  that merely runs *under* the composer while its badge stays clear keeps its
+  badge, because the drawn box is what is judged; (b) with an extreme window the
+  band's two edges can invert — 0.7.0 then drops the head edge and keeps the
+  composer edge instead of inventing a second edge, so only a composer taller than
+  the viewport itself (its top edge above the viewport) hides every badge — a
+  known limitation; (c) the drawing side cannot be verified automatically: the
+  suite pins the pure functions, so the visible result needs a browser check by
+  hand — scroll a quote behind the composer (the badge should disappear while the
+  composer stays clickable), scroll back (it should reappear in place, same
+  number, same spot), and make the composer taller (the disappearing threshold
+  should move with it).
+
+### Changed
+
+- `package.json`'s `description` and both READMEs now promise delivery **with the
+  next message you send whose input is attributed to you**, instead of "the next
+  message you send" full stop, and say that automatic continuation rounds
+  (`source.kind === 'goal'`) and other plugin-injected messages never consume
+  annotations. The `annotation` tool's own description ("delivered automatically
+  with the next user message") already held under the gate, so it is unchanged.
+  The two READMEs' delivery timing, badge and test-count sections were brought in
+  line with the behavior above (0.7.0 adds 8 host cases and rewrites the badge
+  cases; `node --test` reports 67 tests). Re-anchoring, jump-to-source and receipt
+  confirmation were not touched.
+
 ## [0.6.0] - 2026-10-06
 
 ### Fixed

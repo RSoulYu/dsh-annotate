@@ -370,9 +370,11 @@ window.__ModuleLoader__.load({
 
     /* @pure-anchor
      *
-     * Quote anchoring core. Kept free of any DOM reference so it can be
-     * exercised directly by the test suite: the browser side only builds the
-     * segment list and turns the returned offsets back into a Range.
+     * Quote anchoring core, plus the geometry the badge overlay decides with.
+     * Kept free of any DOM reference so it can be exercised directly by the
+     * test suite: the browser side only builds the segment list, turns the
+     * returned offsets back into a Range, and reads the occlusion edges off the
+     * page.
      */
 
     /** Collapse every whitespace run to one space and trim, like the browser does when it copies a selection. */
@@ -558,6 +560,126 @@ window.__ModuleLoader__.load({
         if (wanted[id] === undefined) wanted[id] = fallback[id]
       })
       return wanted
+    }
+
+    /*
+     * Badge overlay visibility.
+     *
+     * The numbered badges are painted into a fixed, full-viewport layer, so
+     * nothing in the page layout stops them from landing on the input box —
+     * where, being clickable, they steal clicks from it. The transcript is
+     * never re-laid out for this, so the same rule the selection side already
+     * applies ("never react to the composer") is applied to drawing: an entry
+     * whose badge box is covered is not drawn at all.
+     */
+
+    /** The host's own fallback for `--dsh-composer-height`, used verbatim. */
+    var COMPOSER_HEIGHT_FALLBACK = 152
+
+    /** The badge's painted size, and how far its box sits above/left of the quote. */
+    var BADGE_SIDE = 18
+    var BADGE_TOP_GAP = 9
+    var BADGE_LEFT_GAP = 11
+
+    /**
+     * The box a badge for `rect` is actually painted in, in viewport coordinates.
+     *
+     * Both the visibility rule and the coordinates handed to the renderer come
+     * from here, so the box that is judged is the box that is drawn: the gap and
+     * the size live in one place, and changing either moves the test with the
+     * paint instead of drifting away from it.
+     *
+     * @param rect `{ top, left }` of the quote in viewport coordinates, or null.
+     * @returns `{ top, left, right, bottom }`, or null when nothing is anchored.
+     */
+    function badgeBox(rect) {
+      if (rect === null || rect === undefined) return null
+      var top = Math.max(2, rect.top - BADGE_TOP_GAP)
+      var left = Math.max(2, rect.left - BADGE_LEFT_GAP)
+      return { top: top, left: left, right: left + BADGE_SIDE, bottom: top + BADGE_SIDE }
+    }
+
+    /**
+     * The band of the viewport the badge overlay must keep out of.
+     *
+     * Only edges backed by a readable source are produced; nothing is guessed:
+     *
+     *   - the bottom edge is taken from the bottom of the transcript scroller
+     *     when it can be measured, and from the viewport only when it cannot;
+     *     that edge is the composer's own top, because the composer sits at the
+     *     bottom of the scroller. The composer's published height (read by
+     *     `composerHeight()`) is what moves it up, and an unusable height falls
+     *     back to the host's own default, never to a number of ours;
+     *   - the transcript scroller's top edge, when it can be measured, is the
+     *     head edge. No header height is ever invented, so an unreadable edge
+     *     simply leaves the head uncropped.
+     *
+     * A band that has collapsed (`top >= bottom`, e.g. a scroller shorter than
+     * the composer) keeps its bottom edge alone: a head edge that reaches at or
+     * past the composer would hide every badge for an area that is not covered
+     * at all.
+     *
+     * Pure on purpose: the browser half parses the custom property and measures
+     * the page, this function only does the arithmetic.
+     *
+     * @param composerHeight parsed `--dsh-composer-height`, or a non-finite or
+     *   non-positive value when it is absent.
+     * @param viewportHeight height of the viewport in CSS pixels, used for the
+     *   bottom edge only when `contentBottom` cannot be measured.
+     * @param contentTop top edge of the transcript scroller in viewport
+     *   coordinates, or a non-finite value when it cannot be measured.
+     * @param contentBottom bottom edge of the transcript scroller in viewport
+     *   coordinates, or a non-finite value when it cannot be measured.
+     * @returns `{ top?, bottom? }` in viewport coordinates; an absent field
+     *   means "no readable source for that edge".
+     */
+    function badgeBand(composerHeight, viewportHeight, contentTop, contentBottom) {
+      var band = {}
+      var anchor = Number.isFinite(contentBottom) ? contentBottom : viewportHeight
+      if (Number.isFinite(anchor)) {
+        var composer = Number.isFinite(composerHeight) && composerHeight > 0 ? composerHeight : COMPOSER_HEIGHT_FALLBACK
+        band.bottom = anchor - composer
+      }
+      if (Number.isFinite(contentTop)) band.top = contentTop
+      if (band.top !== undefined && band.bottom !== undefined && band.top >= band.bottom) delete band.top
+      return band
+    }
+
+    /**
+     * Whether a badge may be drawn at all: does its own box clear the band?
+     *
+     * The box is what the user sees and clicks, so that is what is judged — a
+     * badge hanging over the input box would be painted there and, being
+     * clickable, would take the click meant for the composer. A quote whose rect
+     * merely runs under the composer while its badge stays clear keeps its
+     * badge: only the drawn box decides. An entry is dropped as soon as that box
+     * overlaps an occlusion edge — dropped, never nudged: a badge moved out of
+     * the way reads as an annotation that moved.
+     *
+     * Missing information never hides a badge, which is the behaviour this
+     * overlay had before: a null box means nothing is anchored (and the caller
+     * skips the entry anyway), an absent or unreadable edge contributes no crop.
+     * The vertical out-of-view filter that lives in the caller is a separate
+     * rule and stays there.
+     *
+     * @param box `{ top, bottom }` of the badge in viewport coordinates (see
+     *   {@link badgeBox}), or null.
+     * @param band result of {@link badgeBand}, or anything without readable edges.
+     * @returns true when the box lies entirely outside the band.
+     */
+    function badgeVisibleIn(box, band) {
+      if (box === null || box === undefined) return false
+      var top = box.top
+      var bottom = box.bottom
+      if (!Number.isFinite(top) || !Number.isFinite(bottom)) return true
+      // min/max rather than top/bottom: a box is an interval, and reading it as
+      // one keeps a malformed (inverted) box from slipping past the crop.
+      var low = Math.min(top, bottom)
+      var high = Math.max(top, bottom)
+      var edges = band === null || band === undefined ? {} : band
+      if (Number.isFinite(edges.bottom) && high > edges.bottom) return false
+      if (Number.isFinite(edges.top) && low < edges.top) return false
+      return true
     }
     /* @pure-anchor-end */
 
@@ -1078,18 +1200,71 @@ window.__ModuleLoader__.load({
       ].join('\n')
     }
 
+    /**
+     * The composer height the host publishes, in CSS pixels, or NaN.
+     *
+     * `@deepseek-ai/dsh-client-ui-conversation` (lib/client.js, the
+     * ResizeObserver that watches the composer seat) sets
+     * `--dsh-composer-height` on the transcript scroller element itself, so that
+     * element is asked first; the document root is asked too, because a host
+     * that publishes the value globally would be found there. NaN means "no
+     * readable source": {@link badgeBand} then uses the host's own default
+     * (`@deepseek-ai/dsh-client-ui-chat` writes
+     * `bottom: calc(var(--dsh-composer-height, 152px) + 16px)`) instead of a
+     * value of ours.
+     */
+    function composerHeight() {
+      var elements = [document.querySelector('[data-conversation-scroll]'), document.documentElement]
+      for (var i = 0; i < elements.length; i += 1) {
+        var element = elements[i]
+        if (element === null || element === undefined) continue
+        var value = parseFloat(getComputedStyle(element).getPropertyValue('--dsh-composer-height'))
+        if (Number.isFinite(value) && value > 0) return value
+      }
+      return Number.NaN
+    }
+
+    /**
+     * The occlusion band of the current page, read once per render.
+     *
+     * The scroller is measured for both edges: its top is the head edge, and its
+     * bottom less the composer height is where the composer starts. The viewport
+     * height is passed along only as the fallback for a page where the scroller
+     * cannot be measured at all.
+     */
+    function badgeOcclusionBand() {
+      var scroller = document.querySelector('[data-conversation-scroll]')
+      var measured = scroller === null ? null : scroller.getBoundingClientRect()
+      return badgeBand(
+        composerHeight(),
+        window.innerHeight,
+        measured === null ? Number.NaN : measured.top,
+        measured === null ? Number.NaN : measured.bottom,
+      )
+    }
+
     function badgeList() {
       var numbers = allNumbers()
       var items = []
+      // One band per render: the composer and the transcript body sit at the same
+      // place for every annotation, so the page is asked once.
+      var band = badgeOcclusionBand()
       store.annotations.forEach(function (annotation) {
         var rect = rangeRect(annotation.id)
         if (rect === null) return
         if (rect.bottom < -40 || rect.top > window.innerHeight + 40) return
+        // The box that is judged is the box that is painted: badgeBox() supplies
+        // both. Its coordinates are never adjusted to dodge the occlusion — a
+        // badge moved out of the way reads as an annotation that moved.
+        var box = badgeBox(rect)
+        if (box === null) return
+        if (!badgeVisibleIn(box, band)) return
         items.push({
           annotation: annotation,
           number: numbers[annotation.id],
-          top: Math.max(2, rect.top - 9),
-          left: Math.max(2, rect.left - 11),
+          top: box.top,
+          left: box.left,
+          side: BADGE_SIDE,
           pending: annotation.status === 'pending',
         })
       })
@@ -1118,11 +1293,11 @@ window.__ModuleLoader__.load({
                 top: item.top + 'px',
                 left: item.left + 'px',
                 pointerEvents: 'auto',
-                width: '18px',
-                height: '18px',
+                width: item.side + 'px',
+                height: item.side + 'px',
                 padding: 0,
                 border: '1px solid var(--dsw-alias-bg-base)',
-                borderRadius: '9px',
+                borderRadius: item.side / 2 + 'px',
                 font: '600 10px/1 system-ui, sans-serif',
                 color: '#fff',
                 cursor: 'pointer',

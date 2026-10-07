@@ -10,7 +10,7 @@
  * Run with: node --test
  */
 
-import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, mkdir, readFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -19,7 +19,7 @@ import assert from 'node:assert/strict'
 
 /** Build the fake plugin context, capturing what the plugin registers. */
 function fakeContext() {
-  const captured = { events: new Map(), tools: [], effects: 0, routes: [] }
+  const captured = { events: new Map(), tools: [], effects: 0, routes: [], warns: [] }
   const webServer = {
     register(route) {
       captured.routes.push(route)
@@ -27,7 +27,12 @@ function fakeContext() {
     },
   }
   const ctx = {
-    logger: { warn() {}, info() {} },
+    logger: {
+      warn(message) {
+        captured.warns.push(message)
+      },
+      info() {},
+    },
     on(name, handler) {
       captured.events.set(name, handler)
       return () => {}
@@ -94,6 +99,36 @@ function userStep(text) {
       },
     ],
   }
+}
+
+/**
+ * One message of a step, with the `source.kind` the loop gives it.
+ *
+ * `agent/pre-step` fires for every step of a turn, so the gate decides on
+ * `source.kind === 'user'`: that is the kind input ATTRIBUTED to the user carries
+ * — the human entrypoints (`@deepseek-ai/dsh-api-session-controller`) and the
+ * plugins relaying something the user triggered (`/plan <text>` steers with it,
+ * `/goal` re-injects its attachments with it, agent-teams replays a slash command
+ * with it, and a subagent delegation prompt is 'user' in the child session that
+ * receives it). The loop's own additions under their own kinds are not the user:
+ * the runtime context is `runtime-context` (`@deepseek-ai/dsh-agent-loop`), an
+ * automatic continuation round is `goal` (`@deepseek-ai/dsh-goal-round-driver`),
+ * a background job notice is `tool-jobs` (`@deepseek-ai/dsh-tool-jobs`) — and
+ * `role === 'user'` cannot tell any of them apart, which is why the gate reads
+ * the kind.
+ */
+function messageOf(kind, text) {
+  return {
+    id: `msg-${kind}`,
+    role: 'user',
+    source: { kind },
+    content: [{ type: 'text', text }],
+  }
+}
+
+/** An `enter` decision carrying exactly these messages. */
+function stepOf(...messages) {
+  return { kind: 'enter', messages }
 }
 
 /** The injected block message of one decision, or undefined when there is none. */
@@ -185,7 +220,7 @@ test("the user's own message is left untouched; the block travels as its own mes
     const handler = captured.events.get('agent/pre-step')
     const original = userStep('这是我的问题')
     const decision = await handler(
-      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: original.messages },
       async () => original,
     )
 
@@ -206,7 +241,7 @@ test('the injected message satisfies the session user/message contract', async (
   await withPlugin([record({ id: 'a1' })], async ({ captured }) => {
     const handler = captured.events.get('agent/pre-step')
     const decision = await handler(
-      { agent: { id: 'session-alpha' }, turn: 1, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 1, step: 1, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
     // Mirrors the store's `assertMessageEventShape`: an identified message, the
@@ -234,7 +269,7 @@ test('delivers pending annotations with the next user message', async () => {
   await withPlugin(records, async ({ home, captured }) => {
     const handler = captured.events.get('agent/pre-step')
     const decision = await handler(
-      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: userStep('这是我的问题').messages },
       async () => userStep('这是我的问题'),
     )
 
@@ -268,7 +303,7 @@ test('a block the log never carries is not delivered', async () => {
   await withPlugin([record({ id: 'a1', note: '别丢' })], async ({ home, captured }) => {
     const handler = captured.events.get('agent/pre-step')
     await handler(
-      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
 
@@ -285,7 +320,7 @@ test('a turn that ends without the block re-delivers it on the next message', as
   await withPlugin([record({ id: 'a1', quote: '会被丢掉吗' })], async ({ home, captured }) => {
     const handler = captured.events.get('agent/pre-step')
     const first = await handler(
-      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
     assert.equal(first.messages.length, 2)
@@ -293,7 +328,7 @@ test('a turn that ends without the block re-delivers it on the next message', as
     // While the receipt is unconfirmed nothing else is injected into that
     // session: the block may already be in the log.
     const sameTurn = await handler(
-      { agent: { id: 'session-alpha' }, turn: 4, step: 2, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 4, step: 2, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
     assert.equal(sameTurn.messages.length, 1, 'no duplicate block while one is in flight')
@@ -308,7 +343,7 @@ test('a turn that ends without the block re-delivers it on the next message', as
     assert.equal((await storedById(home)).get('a1').status, 'pending', 'an aborted turn delivers nothing')
 
     const second = await handler(
-      { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: userStep('再问一次').messages },
       async () => userStep('再问一次'),
     )
     assert.equal(second.messages.length, 2, 'the next message carries it again')
@@ -323,7 +358,7 @@ test('a delivered annotation stays delivered when the turn is aborted', async ()
   await withPlugin([record({ id: 'a1', quote: '已经送到的原文' })], async ({ home, captured }) => {
     const handler = captured.events.get('agent/pre-step')
     const decision = await handler(
-      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
     assert.equal(decision.messages.length, 2)
@@ -342,7 +377,7 @@ test('a delivered annotation stays delivered when the turn is aborted', async ()
     assert.equal(persisted.deliveredTurn, 4)
 
     const next = await handler(
-      { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: userStep('再问一次').messages },
       async () => userStep('再问一次'),
     )
     assert.equal(next.messages.length, 1, 'and it does not ride the next message again')
@@ -353,13 +388,13 @@ test('a step/end without the block clears the receipt so it can be re-sent', asy
   await withPlugin([record({ id: 'a1' })], async ({ captured }) => {
     const handler = captured.events.get('agent/pre-step')
     await handler(
-      { agent: { id: 'session-alpha' }, turn: 6, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 6, step: 1, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
     // The step is over (it failed before the append) but the turn continues.
     emitSession(captured, 'session-alpha', 'step/end', { turn: 6, step: 1 })
     const next = await handler(
-      { agent: { id: 'session-alpha' }, turn: 6, step: 2, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 6, step: 2, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
     assert.equal(next.messages.length, 2, 'the receipt was dropped, so the block rides again')
@@ -369,17 +404,242 @@ test('a step/end without the block clears the receipt so it can be re-sent', asy
 test('a later step of the same turn carries nothing extra', async () => {
   await withPlugin([record({ id: 'a1', note: '只有一条' })], async ({ captured }) => {
     const handler = captured.events.get('agent/pre-step')
-    const payload = { agent: { id: 'session-alpha' }, turn: 7, step: 1, messages: [] }
+    const payload = { agent: { id: 'session-alpha' }, turn: 7, step: 1, messages: userStep('问题').messages }
     const first = await handler(payload, async () => userStep('问题'))
     assert.equal(first.messages.length, 2)
     await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(first))
     const second = await handler({ ...payload, step: 2 }, async () => userStep('问题'))
     assert.equal(second.messages.length, 1, 'already delivered, no second injection')
     const laterTurn = await handler(
-      { agent: { id: 'session-alpha' }, turn: 8, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 8, step: 1, messages: userStep('新问题').messages },
       async () => userStep('新问题'),
     )
     assert.equal(laterTurn.messages.length, 1, 'and nothing on the messages after that')
+  })
+})
+
+test('a step that carries no user message consumes nothing', async () => {
+  await withPlugin([record({ id: 'a1', quote: '还在等用户消息' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    const path = join(home, 'annotations', 'annotations.json')
+    const before = await readFile(path, 'utf8')
+
+    // The reported case: the model turn is already running (step 24) when the
+    // annotation is added. The loop claims only what arrived for this step
+    // (`AgentInbox.claim` → `preStep`), so the step carries the runtime context
+    // and nothing attributed to the user — it must not consume the annotation.
+    const original = stepOf(messageOf('runtime-context', '运行时上下文'))
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 12, step: 24, messages: [] },
+      async () => original,
+    )
+
+    assert.equal(decision, original, 'the decision is passed through untouched')
+    assert.equal(blockMessageOf(decision), undefined, 'no block is injected')
+    assert.equal(await readFile(path, 'utf8'), before, 'the pending record is byte-for-byte unchanged')
+    assert.deepEqual(captured.warns, [], 'this is a normal step, not a contract anomaly')
+    assert.equal((await storedById(home)).get('a1').status, 'pending', 'and it is not delivered')
+
+    // No receipt was left behind either: the next message the user sends still
+    // carries it.
+    const user = await handler(
+      { agent: { id: 'session-alpha' }, turn: 12, step: 25, messages: [messageOf('user', '用户的新消息')] },
+      async () => userStep('用户的新消息'),
+    )
+    assert.equal(user.messages.length, 2, 'the annotation rides the next user message instead')
+  })
+})
+
+test('a user-attributed message the step did not claim cannot open delivery', async () => {
+  await withPlugin([record({ id: 'a1', quote: '不该被别人的消息带走' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    // The verdict is taken from the batch the step CLAIMED (`payload.messages`),
+    // which is what the step proposes to send. A later listener appending a
+    // `user`-attributed message to the decision must not be able to turn an
+    // inner step of a running turn into a delivery step.
+    const appended = messageOf('user', '别的监听器塞进决策的消息')
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 7, messages: [] },
+      async () => stepOf(appended),
+    )
+
+    assert.equal(decision.messages.length, 1, 'nothing was claimed, so nothing rides here')
+    assert.equal(blockMessageOf(decision), undefined, 'no block is injected')
+    assert.deepEqual(captured.warns, [], 'an unclaimed step is normal, not a contract anomaly')
+    assert.equal((await storedById(home)).get('a1').status, 'pending', 'the annotation stays pending')
+  })
+})
+
+test('a step with no user message does not even read the store', async () => {
+  await withPlugin([record({ id: 'a1' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    const dir = join(home, 'annotations')
+    const path = join(dir, 'annotations.json')
+
+    // `load()` moves a document it cannot parse aside (`annotations.json.
+    // corrupt-<stamp>`), which makes "did this step read the store at all?" a
+    // question the filesystem answers without instrumentation.
+    await writeFile(path, '{ 不是 JSON', 'utf8')
+
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 2, step: 5, messages: [] },
+      async () => stepOf(messageOf('runtime-context', '运行时上下文')),
+    )
+    assert.deepEqual(decision, stepOf(messageOf('runtime-context', '运行时上下文')))
+    assert.deepEqual(await readdir(dir), ['annotations.json'], 'the store was never read, so nothing was moved aside')
+
+    // The contrast that makes the assertion above meaningful: a step carrying a
+    // user message does read it, and the corrupt document is moved aside.
+    await handler(
+      { agent: { id: 'session-alpha' }, turn: 3, step: 1, messages: [messageOf('user', '用户消息')] },
+      async () => userStep('用户消息'),
+    )
+    const after = await readdir(dir)
+    assert.equal(after.includes('annotations.json'), false, 'the user step reads the store')
+    assert.ok(
+      after.some((entry) => entry.startsWith('annotations.json.corrupt-')),
+      'and moves the document it could not parse aside',
+    )
+  })
+})
+
+test('an automatic goal round does not consume annotations', async () => {
+  await withPlugin([record({ id: 'a1', quote: '不该被续跑带走' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    // `dsh-goal-round-driver` starts a continuation round with
+    // `agent.followup(createUserMessage({ source: { kind: 'goal', … } }))`, and
+    // that appended message also lands on a step 1 — so a step 1 is no proof of
+    // user input; the kind is.
+    const continuation = messageOf('goal', '自动续跑轮次')
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: [continuation] },
+      async () => stepOf(continuation),
+    )
+
+    assert.equal(decision.messages.length, 1, 'the continuation round carries no annotation block')
+    assert.equal((await storedById(home)).get('a1').status, 'pending', 'and consumes nothing')
+
+    const user = await handler(
+      { agent: { id: 'session-alpha' }, turn: 6, step: 1, messages: [messageOf('user', '用户的消息')] },
+      async () => userStep('用户的消息'),
+    )
+    assert.equal(user.messages.length, 2, 'the annotation waits for the user')
+  })
+})
+
+test('a user message still carries the block, and the receipt delivers it', async () => {
+  await withPlugin([record({ id: 'a1', quote: '随用户消息投递' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    const user = {
+      id: 'msg-rpc',
+      role: 'user',
+      source: { kind: 'user', rpcId: 'rpc-1' },
+      content: [{ type: 'text', text: '用户的消息' }],
+    }
+    // The block can follow the user message anywhere in the turn; it is the
+    // message, not the step number, that decides.
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 9, step: 3, messages: [user] },
+      async () => stepOf(user),
+    )
+
+    assert.equal(decision.messages.length, 2, 'the user message plus one block message')
+    assert.deepEqual(decision.messages[0], user, 'the user message is returned verbatim')
+    assert.match(blockTextOf(decision), /随用户消息投递/)
+    assert.equal((await storedById(home)).get('a1').status, 'pending', 'injection alone is not delivery')
+
+    await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(decision))
+    const delivered = (await storedById(home)).get('a1')
+    assert.equal(delivered.status, 'delivered')
+    assert.equal(delivered.deliveredTurn, 9)
+  })
+})
+
+test('a user message arriving while a receipt is in flight gets no second block', async () => {
+  await withPlugin([record({ id: 'a1', quote: '第一条' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    const first = await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [messageOf('user', '第一条消息')] },
+      async () => userStep('第一条消息'),
+    )
+    assert.equal(first.messages.length, 2, 'the first user message carries the block')
+
+    // A second annotation arrives while the first block is unconfirmed. The
+    // receipt gate still wins: injecting now could duplicate the first block.
+    const created = await callApi(captured, {
+      action: 'create',
+      sessionId: 'session-alpha',
+      annotation: { sessionId: 'session-alpha', quote: '第二条', note: '', origin: 'assistant' },
+    })
+    assert.equal(created.status, 200)
+
+    const second = await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 2, messages: [messageOf('user', '第二条消息')] },
+      async () => userStep('第二条消息'),
+    )
+    assert.equal(second.messages.length, 1, 'no duplicate block while one is in flight')
+    assert.equal((await storedById(home)).get(created.payload.annotation.id).status, 'pending')
+
+    // The receipt confirms the first block; the second annotation is still
+    // unsent and rides the user's next message.
+    await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(first))
+    assert.equal((await storedById(home)).get('a1').status, 'delivered')
+    assert.equal((await storedById(home)).get(created.payload.annotation.id).status, 'pending')
+
+    const third = await handler(
+      { agent: { id: 'session-alpha' }, turn: 5, step: 1, messages: [messageOf('user', '第三条消息')] },
+      async () => userStep('第三条消息'),
+    )
+    assert.equal(third.messages.length, 2, 'the still-pending annotation rides the next user message')
+    assert.match(blockTextOf(third), /第二条/)
+  })
+})
+
+test('a non-array message list refuses delivery and says so', async () => {
+  await withPlugin([record({ id: 'a1' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+
+    // A broken payload contract must not be read as "no user message": that
+    // would switch delivery off without a trace.
+    const brokenPayload = await handler(
+      { agent: { id: 'session-alpha' }, turn: 3, step: 1, messages: { oops: true } },
+      async () => ({ kind: 'enter', messages: { oops: true } }),
+    )
+    assert.deepEqual(brokenPayload, { kind: 'enter', messages: { oops: true } }, 'the decision is untouched')
+    assert.equal(captured.warns.length, 1, 'the anomaly is logged exactly once')
+
+    const brokenDecision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 3, step: 2, messages: [] },
+      async () => ({ kind: 'enter' }),
+    )
+    assert.deepEqual(brokenDecision, { kind: 'enter' })
+    assert.equal(captured.warns.length, 2, 'an enter decision with no message list is logged too')
+    for (const warning of captured.warns) {
+      assert.match(String(warning), /not an array/)
+    }
+    assert.equal((await storedById(home)).get('a1').status, 'pending', 'and nothing is consumed')
+  })
+})
+
+test('a wire list with no user-attributed message is never given the block', async () => {
+  await withPlugin([record({ id: 'a1', quote: '不能被挂到别处' })], async ({ home, captured }) => {
+    const handler = captured.events.get('agent/pre-step')
+    // The step claims user input, but the list it will send no longer carries
+    // that message — only the runtime context is left. Its `role` is `user`
+    // (that is the role `createUserMessage` gives the loop's own additions), so
+    // a role-based fallback would quietly hang the block on it and report the
+    // annotation as delivered with no message from the user. Nothing may host it.
+    const context = messageOf('runtime-context', '运行时上下文')
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 4, step: 1, messages: [messageOf('user', '用户消息')] },
+      async () => stepOf(context),
+    )
+
+    assert.deepEqual(decision, stepOf(context), 'the decision is passed through untouched')
+    assert.equal(blockMessageOf(decision), undefined, 'no block is injected')
+    assert.equal(captured.warns.length, 1, 'and it is said out loud instead of silently consumed')
+    assert.match(String(captured.warns[0]), /no user-attributed message/)
+    assert.equal((await storedById(home)).get('a1').status, 'pending', 'the annotation stays pending')
   })
 })
 
@@ -387,7 +647,10 @@ test('no annotations leaves the step untouched', async () => {
   await withPlugin([], async ({ captured }) => {
     const handler = captured.events.get('agent/pre-step')
     const original = userStep('普通消息')
-    const decision = await handler({ agent: { id: 'session-alpha' }, turn: 1, step: 1 }, async () => original)
+    const decision = await handler(
+      { agent: { id: 'session-alpha' }, turn: 1, step: 1, messages: original.messages },
+      async () => original,
+    )
     assert.equal(decision, original, 'the decision object is passed through unchanged')
   })
 })
@@ -436,7 +699,7 @@ test('session ids resolve through either agent shape', async () => {
   await withPlugin([record({ id: 'a1', quote: '嵌套形态' })], async ({ captured }) => {
     const handler = captured.events.get('agent/pre-step')
     const decision = await handler(
-      { agent: { session: { id: 'session-alpha' } }, turn: 2, step: 1 },
+      { agent: { session: { id: 'session-alpha' } }, turn: 2, step: 1, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
     assert.equal(decision.messages.length, 2)
@@ -498,7 +761,7 @@ test('a redelivered annotation rides the next message again', async () => {
 
       // Delivered: it stays out of the way on its own.
       const quiet = await handler(
-        { agent: { id: 'session-alpha' }, turn: 8, step: 1, messages: [] },
+        { agent: { id: 'session-alpha' }, turn: 8, step: 1, messages: userStep('先问一句').messages },
         async () => userStep('先问一句'),
       )
       assert.equal(quiet.messages.length, 1, 'a delivered annotation is not re-sent by itself')
@@ -509,7 +772,7 @@ test('a redelivered annotation rides the next message again', async () => {
       assert.equal(response.payload.annotations.find((item) => item.id === 'a1').status, 'pending')
 
       const decision = await handler(
-        { agent: { id: 'session-alpha' }, turn: 9, step: 1, messages: [] },
+        { agent: { id: 'session-alpha' }, turn: 9, step: 1, messages: userStep('再问一句').messages },
         async () => userStep('再问一句'),
       )
       assert.equal(decision.messages.length, 2, 'the redelivered annotation rides the next message')
@@ -612,7 +875,7 @@ test('a record written before the field existed loads, lists and delivers as bef
 
     const handler = captured.events.get('agent/pre-step')
     const decision = await handler(
-      { agent: { id: 'session-alpha' }, turn: 1, step: 1, messages: [] },
+      { agent: { id: 'session-alpha' }, turn: 1, step: 1, messages: userStep('问题').messages },
       async () => userStep('问题'),
     )
     assert.equal(decision.messages.length, 2, 'an old record still rides the next message')

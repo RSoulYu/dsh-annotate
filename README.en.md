@@ -2,6 +2,10 @@
 
 > Select text in the DSH Web transcript, annotate it, and the host delivers the
 > annotations **with the next message you send** — the model answers them by number.
+> Delivery is gated on the step's input being **attributed to you**
+> (`source.kind === 'user'`): an annotation added while a turn is already running
+> is not taken by that turn's later steps, and neither automatic goal rounds nor
+> background job notices count as you.
 
 [![ci](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml/badge.svg)](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -44,6 +48,7 @@ inside your own bubble — your message itself is returned byte for byte (see
 | | |
 |---|---|
 | Select to annotate | A small one-button toolbar appears above the selection; it is viewport-clamped and never overlaps the composer or the submit button |
+| Badges stay off the composer | The numbered badges live in a fixed overlay, and a badge whose **own box** would fall inside the composer (or the measurable transcript head) occlusion band is dropped entirely — never nudged, since a badge moved out of the way reads as an annotation that moved (0.7.0; costs in [Limitations](#limitations) item 11) |
 | Note optional | Empty note = mark the quote only |
 | Read in place | Click the numbered badge next to the quote for a popover with the quote, the note, and jump-to-source / open-in-sidebar / redeliver (delivered annotations only) / delete |
 | No DOM surgery | Highlights use the CSS Custom Highlight API; no node is injected into or rewritten inside a rendered message. That is about the DOM — delivery does add the block to the transcript, as its own injected-context message, see [Limitations](#limitations) item 1 |
@@ -51,7 +56,7 @@ inside your own bubble — your message itself is returned byte for byte (see
 | Right-sidebar panel | A two-stage right-sidebar tab with edit / delete / jump / redeliver / clear-delivered / refresh |
 | Durable | `$DSH_HOME/annotations/annotations.json`, shared across sessions and restarts, outside every workspace |
 | Stable numbering | Panel #3 is `Annotation 3` in the reply |
-| Delivered once | Annotations are marked delivered only once the session log carries the message holding their block, and are never re-sent |
+| Delivered once | Annotations are marked delivered only once the session log carries the message holding their block, and are never re-sent; delivery itself happens only on the step that carries input attributed to you (0.7.0) |
 | Redeliver | A delivered annotation can be put back in the queue from the badge popover or the sidebar row: it rides your next message again. That is a genuine second send — the block already in the log is not retracted |
 | Repeated quotes stay put | Which occurrence of the quote an annotation was made on is captured from the live selection when the editor opens and persisted with the record (0.6.0). Re-anchoring and Jump to source use that value, so annotating the same spot twice keeps both marks on that one spot; only records without the field fall back to creation order |
 | Agent tool | `annotation` with `list` / `resolve` actions, for re-reading after a compaction |
@@ -85,7 +90,8 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
   state, not an assumption: `agent/pre-step` only proposes the block, and the
   annotations are marked delivered once the session log publishes the message
   that carries it. A step stopped or failed before that point leaves them
-  pending, and the next message you send carries them again.
+  pending, and the next message you send carries them again — and only a step
+  whose input is attributed to you takes them (0.7.0, see Limitations 7).
 - **Your own words stay your own.** The block is a separate injected-context
   message; your bubble never grows text you did not type, and your message is
   returned byte for byte.
@@ -171,18 +177,29 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
 5. **Text only.** Text inside images or inside structured tool-call cards cannot
    be selected.
 6. **Numbering is per session.**
-7. **Delivery waits for the next message to enter the model.** If the model is
-   busy and your message is queued, the block rides that queued message when it is
-   processed; if the message is never processed, the annotations stay "pending".
-   Delivery is confirmed by the session log: `agent/pre-step` returns before the
-   loop's abort check and before `prepareRequest`, so an abort (or a request that
-   fails while being prepared) **before the block reaches the log** means the
-   message is never appended, the annotations go back to "pending" and ride your
-   next message. Once the block *is* in the log, a later abort does not undo it:
-   the record stays delivered, and a regression test pins that. The cost is one
-   narrow duplicate window — if the process exits after the block reached the log
-   but before the "delivered" status was written, those annotations still read as
-   pending next boot and are sent once more.
+7. **Delivery only happens on the step that carries input attributed to you,
+   and the block rides that message in.** The verdict is taken from the batch the
+   step **claimed** — the input it is about to send — and asks whether any of it
+   carries `source.kind === 'user'`. That is attribution, not typing: `/plan
+   <text>` steers the text you just sent, `/goal` re-injects its attachments, a
+   replayed agent-teams slash command, and a subagent delegation prompt in the
+   child session all count, while automatic continuation rounds
+   (`source.kind === 'goal'`), background job notices (`tool-jobs`) and the
+   runtime context (`runtime-context`) do not. Cost: an annotation added **while a
+   turn is running** waits for your next message instead of riding the step the
+   model is already executing — it stays "pending" until then (the `annotation`
+   tool can still read it on demand), and no non-user step takes it away. If the
+   model is busy and your message is queued, the block rides that queued message
+   when it is processed; if the message is never processed, the annotations stay
+   "pending". Delivery is confirmed by the session log: `agent/pre-step` returns
+   before the loop's abort check and before `prepareRequest`, so an abort (or a
+   request that fails while being prepared) **before the block reaches the log**
+   means the message is never appended, the annotations go back to "pending" and
+   ride your next message. Once the block *is* in the log, a later abort does not
+   undo it: the record stays delivered, and a regression test pins that. The cost
+   is one narrow duplicate window — if the process exits after the block reached
+   the log but before the "delivered" status was written, those annotations still
+   read as pending next boot and are sent once more.
 8. **The local HTTP route is fenced, not private.** Two gates: the `Host` must be
    loopback (DNS rebinding), and the request must carry a per-boot token that is
    written only into the boot payload of pages this process served. A local
@@ -192,12 +209,41 @@ Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
    `~/.dsh/annotations/` until you delete it.
 10. **Verified on Linux only.** The code uses `node:*` builtins and browser APIs,
     so it should be portable, but macOS/Windows are untested.
+11. **Badge occlusion: a badge whose own box falls into the occlusion band is not
+    drawn at all (0.7.0).** The criterion is the **badge's own box** (`rect.top -
+    9`, 18 px tall), not the whole quote; a hit drops the entry entirely and the
+    coordinates are **never** moved — a nudged badge would read as an anchor
+    drift. Costs and known limits:
+    - once a quote's top has scrolled behind the composer (or above the
+      transcript head), that badge is not drawn for that scroll position and
+      cannot be clicked in the transcript until you scroll back — the sidebar tab
+      still offers jump / edit / delete / redeliver. Note that a quote merely
+      running *under* the composer while its badge stays clear **keeps** its badge:
+      0.7.0 deliberately tightened this so a partly covered quote does not lose a
+      badge that is not itself in the way;
+    - with an extreme window (header + composer height ≥ viewport height) the
+      band's two edges can invert; 0.7.0 then drops the head edge and keeps the
+      composer edge instead of inventing a second edge, so only a composer taller
+      than the viewport itself (its top edge above the viewport) hides **every**
+      badge — a known limitation;
+    - the drawing side **cannot be verified automatically**: the suite pins the
+      pure functions (both band edges and the 152 px fallback, the measured
+      scroller bottom, box/band intersection, the edge counting as outside, and
+      degenerate input never throwing). Check by hand in the browser: scroll a
+      quote behind the composer — the badge should disappear while the composer
+      stays clickable; scroll back — it should reappear in place, same number,
+      same spot; make the composer taller — the disappearing threshold should move
+      with it.
+    - the band depends on the host publishing `--dsh-composer-height` (on
+      `[data-conversation-scroll]`; when it cannot be read the host's own `152px`
+      default is used); the head edge needs that same container and is simply not
+      cropped when it cannot be measured — no header height is ever invented.
 
 ## Development
 
 ```sh
 node --check index.js && node --check client.js
-node --test                # 46 tests: delivery, authorization, anchoring
+node --test                # 67 tests: delivery, authorization, anchoring, badge occlusion
 ```
 
 Do **not** pass `test/` to the runner. Node 22 resolves a positional argument as a
@@ -209,6 +255,12 @@ inside `client.js` and the test evaluates that exact slice, so there is no secon
 copy of the algorithm to drift. That slice does not touch the DOM; mapping the
 live selection onto it (`segmentPositionOf` / `occurrenceOfRange`) is the only
 part of the creation-time capture that a unit test cannot reach.
+
+The badge-occlusion band is decided by pure functions inside that same
+`@pure-anchor` slice (`badgeBand` / `badgeBox` / `badgeVisibleIn`), so the tests
+pin the arithmetic — both band edges and the 152 px fallback, the measured
+scroller bottom, the badge box, and the degenerate inputs — while the visible
+result stays a browser check (Limitations 11).
 
 The host half imports only `node:*` builtins — a workspace-installed bundle
 cannot resolve `@deepseek-ai/*` packages at runtime. The browser half only

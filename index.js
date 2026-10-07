@@ -11,9 +11,13 @@
  *   3. registers the `annotation` tool so the agent can read and resolve them
  *      on its own, and
  *   4. delivers them at `agent/pre-step`: the annotation block is put on the
- *      wire as its own message, right after the user message entering the step,
- *      so the model receives it with the message the user actually sent — no
- *      composer DOM, no draft rewriting. The block is a separate `user/message`
+ *      wire as its own message, right after the user's input entering the step,
+ *      so the model receives it with what the user just sent — no composer DOM,
+ *      no draft rewriting. That step must carry input attributed to the user
+ *      (see "Which step carries the user's message" below): `agent/pre-step`
+ *      fires for EVERY step of a turn, so without that gate an annotation added
+ *      while the turn is already running would be consumed by the very next step
+ *      of that same turn. The block is a separate `user/message`
  *      whose `source.kind` is not `user`, which is what keeps it out of the
  *      user's own bubble: the chat renders an appended `user/message` as a
  *      bubble only for `source.kind === "user"` and as an injected-context row
@@ -33,6 +37,33 @@
  *
  * While one receipt is unconfirmed the session injects nothing further: the
  * block may already be in the log, and a second injection would duplicate it.
+ *
+ * "Which step carries the user's message" is decided by `source.kind`, never by
+ * `role` and never by `step === 1`. The loop claims a batch of inbox messages
+ * for the step and hands that same array to every `agent/pre-step` listener
+ * (`@deepseek-ai/dsh-agent-loop` `AgentInbox.claim` → `preStep`, payload
+ * `{ messages: claimed, turn, step, signal }`), so that batch *is* the input the
+ * step is about to send. The criterion is attribution, not "the human typed it":
+ * human entrypoints always attribute their message to the user
+ * (`@deepseek-ai/dsh-api-session-controller` writes `source.kind === "user"`),
+ * and so do plugins relaying something the user triggered — `/plan <text>`
+ * steers the text the user just typed with `source: { kind: "user" }`
+ * (`@deepseek-ai/dsh-plan-mode`), which a LATER step of that same turn claims;
+ * `/goal` re-injects its attachments the same way
+ * (`@deepseek-ai/dsh-command-goal`); a replayed agent-teams slash command does
+ * too (`@nanmicoder/dsh-agent-teams` `command.js:91,107`); and a subagent
+ * delegation prompt is `user` in the child session that receives it
+ * (`@deepseek-ai/dsh-subagent`).
+ *
+ * What the gate must keep out is everything the loop and other plugins put in
+ * front of the model under their OWN kind: the runtime context folded into every
+ * step (`runtime-context`, `@deepseek-ai/dsh-agent-loop`), automatic
+ * continuation rounds (`goal`, `@deepseek-ai/dsh-goal-round-driver`), background
+ * job notices (`tool-jobs`, `@deepseek-ai/dsh-tool-jobs`), and any other
+ * plugin's injection. Matching on `role === "user"` cannot separate those from
+ * the user's own input — `createUserMessage` gives that role to every one of
+ * them — which is why the gate reads `source.kind`. And a `step === 1` test
+ * would re-open this exact defect: a goal round also lands on a step 1.
  *
  * Runtime imports stay on `node:*` builtins on purpose: a workspace-installed
  * bundle cannot resolve `@deepseek-ai/*` packages, so the host half must be
@@ -57,7 +88,7 @@ export const inject = ['tools']
  * re-activated; the tool reports this value so "which revision is live" is
  * answerable without a restart-and-guess.
  */
-const REVISION = 7
+const REVISION = 8
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
 /**
@@ -291,10 +322,11 @@ class AnnotationStore {
    * Put one record back in the delivery queue.
    *
    * Only the persisted state changes: the record returns to `pending` and the
-   * delivery receipt (`deliveredAt`/`deliveredTurn`) is dropped, so the next
-   * `agent/pre-step` of that session picks it up again like any other pending
-   * annotation. This deliberately does not inject anything itself — injection is
-   * the pre-step listener's job, and it is confirmed off the session log.
+   * delivery receipt (`deliveredAt`/`deliveredTurn`) is dropped, so the next step
+   * that carries input attributed to the user picks it up again like any other
+   * pending annotation — a step that carries none never takes it. This
+   * deliberately does not inject anything itself: injection is the pre-step
+   * listener's job, and it is confirmed off the session log.
    *
    * Idempotent: a record that is already pending comes back pending (with a
    * refreshed `updatedAt`).
@@ -433,7 +465,7 @@ function blockMessage(block) {
 
 /**
  * Put the annotation block on the wire as its own message, immediately after
- * the last user message of one step.
+ * the user-attributed message the step carries.
  *
  * The user's own message is returned untouched: the block is an additional
  * entry in the list, not extra text on their message. DSH appends every entry
@@ -441,25 +473,26 @@ function blockMessage(block) {
  * (and therefore still reaches the model), it just stops being part of the
  * words the user typed.
  *
+ * The host is the message the step carries from the user
+ * (`role === "user"` and `source.kind === "user"`) — and that is the ONLY host
+ * this function accepts. There is deliberately no `role === "user"` fallback:
+ * `createUserMessage` gives the `user` role to the loop's own runtime context
+ * and to every plugin notice (`runtime-context`, `goal`, `tool-jobs`, …), so a
+ * fallback would silently hang the block on a message the user never sent —
+ * which is exactly the defect the pre-step gate exists to prevent. When no such
+ * message is on the list, nothing is injected and the annotations stay pending
+ * for the user's next message.
+ *
  * @returns the replacement message list, or undefined when nothing applies.
  */
 function injectIntoMessages(messages, block) {
   if (!Array.isArray(messages) || messages.length === 0) return undefined
   let index = -1
-  // Prefer a genuine user-authored message; fall back to the last user-role one.
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i]
     if (message?.role === 'user' && message?.source?.kind === 'user') {
       index = i
       break
-    }
-  }
-  if (index === -1) {
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (messages[i]?.role === 'user') {
-        index = i
-        break
-      }
     }
   }
   if (index === -1) return undefined
@@ -617,6 +650,34 @@ export function apply(ctx) {
     if (decision?.kind !== 'enter') return decision
     const sessionId = sessionIdOf(payload?.agent)
     if (sessionId.length === 0) return decision
+    // Deliver only on a step that carries input attributed to the user.
+    // `agent/pre-step` runs for EVERY step of a turn, so without this gate an
+    // annotation added while the turn is already running would ride the next step
+    // of that same turn (reported live: a block landed on step 24 of a turn with
+    // no user message).
+    //
+    // The verdict is taken from the batch this step CLAIMED (`payload.messages`)
+    // — the array the loop hands to every listener and returns as the enter
+    // decision (`{ messages: claimed, turn, step, signal }`, agent-loop
+    // `preStep`) — not from `decision.messages`, which a later listener may have
+    // added to. The block itself is still injected into `decision.messages`, the
+    // list the step will actually send. And the criterion is `source.kind`, not
+    // `role`: `createUserMessage` gives the `user` role to the runtime context
+    // and to plugin notices alike, while only input attributed to the user
+    // carries `source.kind === 'user'` — a step 1 is no guide either, since a
+    // goal round lands on a step 1 too (see the module header for the sources).
+    //
+    // This sits before `store.load()` on purpose: a step that carries no
+    // user-attributed input must not pay for a store read (or, worse, leave a
+    // receipt), and the annotation must stay pending for the user's next message.
+    const claimed = payload?.messages
+    if (!Array.isArray(claimed) || !Array.isArray(decision.messages)) {
+      // A broken payload contract is not "no user input": say so instead of
+      // silently switching delivery off for the session.
+      logger.warn?.('dsh-annotate: agent/pre-step messages are not an array; skipping delivery for this step')
+      return decision
+    }
+    if (!claimed.some((message) => message?.source?.kind === 'user')) return decision
     try {
       await store.load()
       // One receipt at a time. A live one means the previous block may already
@@ -628,7 +689,14 @@ export function apply(ctx) {
       if (pending.length === 0) return decision
       const block = renderBlock(pending, numbering(store.list(sessionId)))
       const messages = injectIntoMessages(decision.messages, block)
-      if (messages === undefined) return decision
+      if (messages === undefined) {
+        // The claimed batch had user-attributed input but the list this step will
+        // send has none to hang the block on. Nothing else may host it, so the
+        // annotations stay pending — and this is said out loud rather than
+        // silently consumed.
+        logger.warn?.('dsh-annotate: no user-attributed message to carry the annotation block; nothing injected')
+        return decision
+      }
       // Deliberately NOT marked delivered here: the loop still has its abort
       // check and `prepareRequest` to get through before this message is
       // appended, and a block the model never received is not delivered.

@@ -26,8 +26,12 @@ const {
   occurrenceAt,
   storedOccurrence,
   wantedOccurrences,
+  badgeBox,
+  badgeBand,
+  badgeVisibleIn,
+  BADGE_SIDE,
 } = new Function(
-  `${source.slice(from, to)}\nreturn { normalizeQuote, buildAnchorIndex, locateQuote, quoteOccurrences, occurrenceAt, storedOccurrence, wantedOccurrences }`,
+  `${source.slice(from, to)}\nreturn { normalizeQuote, buildAnchorIndex, locateQuote, quoteOccurrences, occurrenceAt, storedOccurrence, wantedOccurrences, badgeBox, badgeBand, badgeVisibleIn, BADGE_SIDE }`,
 )()
 
 /** Build the segment list the browser side would hand to the index. */
@@ -298,4 +302,177 @@ test('a record that knows its occurrence does not consume a fallback ordinal', (
   assert.equal(wanted.later, 1)
   assert.deepEqual({ ...wantedOccurrences([]) }, {})
   assert.deepEqual({ ...wantedOccurrences(undefined) }, {})
+})
+
+/* ------------------------------------------- badge overlay visibility ---- */
+
+/** A quote rect in the viewport coordinates rangeRect() hands the badge builder. */
+function rectOf(top, bottom, left = 40) {
+  return { top, bottom, left }
+}
+
+/** The badge box for a 40px-tall quote starting at `top`. */
+function boxAt(top) {
+  return badgeBox(rectOf(top, top + 40))
+}
+
+test('the extracted slice reaches for no DOM at all', () => {
+  // The slice is evaluated as it ships, so a DOM member access in it would only
+  // show up in the browser. Guard it here: the browser half reads the page.
+  assert.doesNotMatch(
+    source.slice(from, to),
+    /\b(document|window|getComputedStyle|requestAnimationFrame|navigator|localStorage)\s*\./,
+  )
+})
+
+test('the box that is judged is the box the renderer is given', () => {
+  assert.deepEqual(badgeBox(rectOf(300, 340)), { top: 291, left: 29, right: 47, bottom: 309 })
+  assert.equal(BADGE_SIDE, 18, 'the painted size is still 18px')
+  // Clamped near the viewport edges exactly like the coordinates were before.
+  assert.equal(badgeBox(rectOf(-100, 30)).top, 2)
+  assert.equal(badgeBox(rectOf(-100, 30, 0)).left, 2)
+  assert.equal(badgeBox(null), null)
+  assert.equal(badgeBox(undefined), null)
+})
+
+test('a quote whose badge would sit on the input box gets no badge', () => {
+  // 900px viewport, a 152px composer: the input box starts at 748.
+  const band = badgeBand(152, 900, Number.NaN)
+  assert.equal(band.bottom, 748)
+  // The badge for a quote starting at 748 spans [739, 757]: over the input box.
+  assert.equal(badgeVisibleIn(boxAt(748), band), false, 'the badge itself is over the input box')
+  assert.equal(badgeVisibleIn(boxAt(760), band), false, 'entirely inside the band')
+  assert.equal(badgeVisibleIn(boxAt(100), band), true, 'well above the composer')
+})
+
+test('a quote that only runs under the composer keeps its badge', () => {
+  // The straddle case: the quote's rect overlaps the band, the badge box does
+  // not. The badge is what is drawn and clicked, so it stays — judging the whole
+  // rect would hide a badge that covers nothing.
+  const band = badgeBand(152, 900, Number.NaN)
+  const rect = rectOf(700, 760)
+  assert.equal(badgeVisibleIn(rect, band), false, 'the coarse rect rule hides it')
+  assert.equal(badgeBox(rect).bottom, 709)
+  assert.equal(badgeVisibleIn(badgeBox(rect), band), true, 'but the drawn box clears the composer')
+})
+
+test('a badge box exactly at the band edge is still drawn', () => {
+  const band = badgeBand(152, 900, Number.NaN)
+  // box.bottom = rect.top + 9, so a quote starting at 739 ends the box on 748.
+  assert.equal(badgeBox(rectOf(739, 900)).bottom, 748)
+  assert.equal(badgeVisibleIn(boxAt(739), band), true, 'bottom on the edge')
+  assert.equal(badgeVisibleIn(boxAt(739.5), band), false, 'half a pixel into the band hides it')
+})
+
+test('a missing composer height falls back to the host default of 152px', () => {
+  for (const missing of [Number.NaN, undefined, null, 0, -1, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, '152px']) {
+    assert.equal(
+      badgeBand(missing, 900, Number.NaN).bottom,
+      900 - 152,
+      `${String(missing)} must fall back to the host default`,
+    )
+  }
+  // A readable value is used verbatim: not rounded, not replaced by the default.
+  assert.equal(badgeBand(208, 900, Number.NaN).bottom, 900 - 208)
+})
+
+test('the bottom edge comes from the measured transcript bottom', () => {
+  // Measured: the scroller ends at 880 and the composer is 152 high, so the
+  // input box starts at 728 — not at 748, which the viewport alone would say.
+  const measured = badgeBand(152, 900, Number.NaN, 880)
+  assert.deepEqual(measured, { bottom: 728 })
+  assert.equal(badgeVisibleIn(boxAt(730), measured), false, 'hidden at the composer that is really there')
+  assert.equal(badgeVisibleIn(boxAt(730), badgeBand(152, 900, Number.NaN)), true, 'the viewport-only edge would have drawn it')
+  // No measured bottom: the viewport is the source again.
+  assert.deepEqual(badgeBand(152, 900, Number.NaN, Number.NaN), { bottom: 748 })
+  // Neither readable: no bottom edge at all, nothing is hidden on a guess.
+  assert.deepEqual(badgeBand(152, Number.NaN, Number.NaN, Number.NaN), {})
+})
+
+test('the transcript top edge crops the head, and is skipped when unreadable', () => {
+  const head = badgeBand(152, 900, 64)
+  assert.deepEqual(head, { bottom: 748, top: 64 })
+  assert.equal(badgeVisibleIn(boxAt(40), head), false, 'the box would be painted above the transcript body')
+  assert.equal(badgeVisibleIn(boxAt(64), head), false, 'a badge floats above its quote, so the body edge is not enough')
+  assert.equal(badgeVisibleIn(boxAt(73), head), true, 'box top exactly on the body edge')
+  assert.equal(badgeVisibleIn(boxAt(80), head), true, 'inside the transcript')
+
+  const noHead = badgeBand(152, 900, Number.NaN)
+  assert.deepEqual(noHead, { bottom: 748 }, 'no header height is invented')
+  assert.equal(badgeVisibleIn(boxAt(-200), noHead), true, 'uncropped head: the out-of-view filter owns it')
+})
+
+test('a collapsed band keeps its bottom edge alone', () => {
+  // Scroller top at 800 with its bottom at 880 and a 152px composer: the head
+  // edge would land past the composer, so it is dropped rather than hiding every
+  // badge for an area nothing covers.
+  assert.deepEqual(badgeBand(152, 900, 800, 880), { bottom: 728 })
+  assert.deepEqual(badgeBand(152, 900, 728, 880), { bottom: 728 }, 'top == bottom is collapsed too')
+  assert.deepEqual(badgeBand(152, 900, 727, 880), { bottom: 728, top: 727 }, 'one pixel of band keeps both edges')
+})
+
+test('an unmeasurable viewport keeps the previous behaviour', () => {
+  const band = badgeBand(152, Number.NaN, Number.NaN)
+  assert.deepEqual(band, {}, 'no readable source, no edge')
+  assert.equal(badgeVisibleIn(boxAt(0), band), true, 'nothing is hidden on a guess')
+})
+
+test('badgeVisibleIn is safe on absent and degenerate input', () => {
+  const band = badgeBand(152, 900, 64)
+  assert.equal(badgeVisibleIn(null, band), false, 'nothing is anchored, so there is no badge')
+  assert.equal(badgeVisibleIn(undefined, band), false)
+  for (const degenerate of [{ top: Number.NaN, bottom: Number.NaN }, { top: 10 }, { bottom: 20 }, {}]) {
+    assert.equal(badgeVisibleIn(degenerate, band), true, 'unknown geometry never hides a badge')
+  }
+  assert.equal(badgeVisibleIn({ top: 800, bottom: 700 }, band), false, 'an inverted box is still an interval in the band')
+  for (const absentBand of [null, undefined, {}, { top: Number.NaN, bottom: Number.NaN }, { bottom: '748px' }]) {
+    assert.equal(badgeVisibleIn({ top: 900, bottom: 918 }, absentBand), true, 'no readable edge, no crop')
+  }
+  // A degenerate rect still produces a box, and neither call throws.
+  const degenerateBox = badgeBox(rectOf(Number.NaN, Number.NaN))
+  assert.equal(Number.isFinite(degenerateBox.top), false)
+  assert.equal(badgeVisibleIn(degenerateBox, band), true)
+})
+
+/* ---------------------------------------- overlay rendering contract ----- */
+
+/** The source of one client.js function, found by name (line numbers drift). */
+function sourceOf(name) {
+  const start = source.indexOf(`function ${name}(`)
+  assert.notEqual(start, -1, `client.js must still define ${name}()`)
+  let depth = 0
+  for (let i = source.indexOf('{', start); i < source.length; i += 1) {
+    if (source[i] === '{') depth += 1
+    else if (source[i] === '}') {
+      depth -= 1
+      if (depth === 0) return source.slice(start, i + 1)
+    }
+  }
+  throw new Error(`unterminated ${name}()`)
+}
+
+test('the badge builder judges the drawn box and keeps the out-of-view filter', () => {
+  const body = sourceOf('badgeList')
+  assert.match(body, /rect\.bottom < -40 \|\| rect\.top > window\.innerHeight \+ 40/, 'the vertical filter is unchanged')
+  assert.match(body, /var box = badgeBox\(rect\)/, 'the box is built once, by the shared helper')
+  assert.match(body, /if \(!badgeVisibleIn\(box, band\)\) return/, 'the drawn box is what is judged')
+  assert.match(body, /top: box\.top/, 'the judged box supplies the rendered top')
+  assert.match(body, /left: box\.left/, 'the judged box supplies the rendered left')
+  assert.match(body, /side: BADGE_SIDE/, 'the judged size is the painted size')
+  assert.doesNotMatch(body, /rect\.top - 9|rect\.left - 11/, 'no second copy of the offsets to drift from')
+})
+
+test('the badge overlay keeps its float contract and reads both measured edges', () => {
+  const badges = sourceOf('Badges')
+  assert.match(badges, /pointerEvents: 'none'/, 'the overlay stays click-through')
+  assert.match(badges, /pointerEvents: 'auto'/, 'the badge itself stays clickable')
+  assert.match(badges, /width: item\.side \+ 'px'/)
+  assert.match(badges, /height: item\.side \+ 'px'/)
+  assert.doesNotMatch(badges, /'18px'/, 'no second copy of the size to drift from the criterion')
+  const band = sourceOf('badgeOcclusionBand')
+  assert.match(band, /querySelector\('\[data-conversation-scroll\]'\)/, 'the transcript scroller is measured')
+  assert.match(band, /measured\.top/, 'its top is the head edge')
+  assert.match(band, /measured\.bottom/, 'its bottom anchors the composer edge')
+  assert.match(sourceOf('composerHeight'), /--dsh-composer-height/, 'the composer height comes from the host property')
+  assert.match(sourceOf('badgeBox'), /BADGE_SIDE/, 'the box size comes from the shared constant')
 })
