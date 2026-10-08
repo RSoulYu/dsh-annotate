@@ -1,270 +1,95 @@
 # dsh-annotate
 
-> Select text in the DSH Web transcript, annotate it, and the host delivers the
-> annotations **with the next message you send** — the model answers them by number.
-> Delivery is gated on the step's input being **attributed to you**
-> (`source.kind === 'user'`): an annotation added while a turn is already running
-> is not taken by that turn's later steps, and neither automatic goal rounds nor
-> background job notices count as you.
+**Select text in the DSH Web transcript, annotate it, and it rides your next message to the model — answered by number.**
 
-[![ci](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml/badge.svg)](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![ci](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml/badge.svg)](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![version](https://img.shields.io/badge/version-0.7.0-green.svg)](CHANGELOG.md)
 
-[简体中文](README.md) | **English (summary)**
-
-This is a summary. The full documentation — including the injected block format,
-the HTTP API, the data/privacy table and the complete list of limitations — lives
-in the [Chinese README](README.md). The sections below cover everything a new
-user or a reviewer needs.
-
----
+[简体中文](README.md) | **English** · [CHANGELOG](CHANGELOG.md)
 
 ## What it is
 
-A pure plugin for DSH (DeepSeek Harness) Web. You select a sentence in a reply,
-write a note (or leave it empty to mark the quote only), and keep typing your
-question as usual. Right before your message reaches the model, the host appends
-an annotation block to it:
+When a long answer raises a question about two or three specific sentences, you normally have to copy the quotes into the composer by hand. This plugin closes that gap:
 
-```
-—— 批注（共 1 处，编号 1）——
+1. **Select a sentence** in the transcript and write an annotation (or leave it empty to just mark the text);
+2. Keep typing and press enter as usual — **no manual quoting**;
+3. Before your message reaches the model, the plugin appends the annotation block **as its own separate message**;
+4. The model answers them one by one as `Annotation 1: …`.
 
-1. 原文：「the sentence you marked」
-   批注：your note
-
-请用「Annotation 1：…」的格式逐条回应；…
-```
-
-Nothing is written into the composer, so nothing can be overwritten and lost on
-submit. The block travels as a message of its own, though: the host puts it right
-after the `user/message` about to enter the model, with a `source.kind` that is
-not `user`, so it lands in the session log as an injected-context row instead of
-inside your own bubble — your message itself is returned byte for byte (see
-[Limitations](#limitations) item 1).
-`cordis.patch.yml` inserts exactly one host row; no DSH core file is touched.
-
-## Features
-
-| | |
-|---|---|
-| Select to annotate | A small one-button toolbar appears above the selection; it is viewport-clamped and never overlaps the composer or the submit button |
-| Badges stay off the composer | The numbered badges live in a fixed overlay, and a badge whose **own box** would fall inside the composer (or the measurable transcript head) occlusion band is dropped entirely — never nudged, since a badge moved out of the way reads as an annotation that moved (0.7.0; costs in [Limitations](#limitations) item 11) |
-| Note optional | Empty note = mark the quote only |
-| Read in place | Click the numbered badge next to the quote for a popover with the quote, the note, and jump-to-source / open-in-sidebar / redeliver (delivered annotations only) / delete |
-| No DOM surgery | Highlights use the CSS Custom Highlight API; no node is injected into or rewritten inside a rendered message. That is about the DOM — delivery does add the block to the transcript, as its own injected-context message, see [Limitations](#limitations) item 1 |
-| Composer chip | `✎ ×N` in the composer tool row, immediately before Send; rendered only when the session has annotations |
-| Right-sidebar panel | A two-stage right-sidebar tab with edit / delete / jump / redeliver / clear-delivered / refresh |
-| Durable | `$DSH_HOME/annotations/annotations.json`, shared across sessions and restarts, outside every workspace |
-| Stable numbering | Panel #3 is `Annotation 3` in the reply |
-| Delivered once | Annotations are marked delivered only once the session log carries the message holding their block, and are never re-sent; delivery itself happens only on the step that carries input attributed to you (0.7.0) |
-| Redeliver | A delivered annotation can be put back in the queue from the badge popover or the sidebar row: it rides your next message again. That is a genuine second send — the block already in the log is not retracted |
-| Repeated quotes stay put | Which occurrence of the quote an annotation was made on is captured from the live selection when the editor opens and persisted with the record (0.6.0). Re-anchoring and Jump to source use that value, so annotating the same spot twice keeps both marks on that one spot; only records without the field fall back to creation order |
-| Agent tool | `annotation` with `list` / `resolve` actions, for re-reading after a compaction |
+A pure plugin: `cordis.patch.yml` inserts a single Host row and touches no file of DSH itself.
 
 ## Install
 
 ```sh
-dsh plugin --profile web add github:RSoulYu/dsh-annotate   # from GitHub
-dsh plugin --profile web add /path/to/dsh-annotate         # from a local checkout
-dsh plugin --profile web remove dsh-annotate               # uninstall
+dsh plugin --profile <profile> add github:RSoulYu/dsh-annotate
+dsh plugin --profile <profile> remove dsh-annotate    # uninstall
 ```
 
-Changing `client.js` needs a browser hard refresh; changing `index.js` needs a
-`dsh web` restart, because this profile ships with module HMR disabled
-(`hmr.root: []`).
+Requires DSH `0.2.0-rc.2` (the slots and two-stage registration contracts it uses follow 0.2.x; `0.1.x` is not supported). After changing `client.js` a browser hard refresh is enough; after changing `index.js` restart `dsh web`.
 
-## Requirements
+## Usage
 
-- DSH `0.2.0-rc.2` (Web profile). `0.1.x` is **not** supported: the plugin uses
-  `conversation.input.right`, the two-stage right-sidebar tab registration and
-  `ctx.sidebarRight.openTab`.
-- Chromium 105+ for the highlight (everything else keeps working without it).
-- The right-sidebar tab depends on `@deepseek-ai/dsh-client-ui-sidebar-right`
-  being enabled.
+| Action | How |
+|---|---|
+| Add | Select text → click the floating "annotate" button → type → `Enter` to save (`Shift+Enter` newline, `Esc` cancel) |
+| Read | Click the **numbered badge** beside the quote for an in-place card: number, status, quote, note, plus jump-to-quote / open in sidebar / redeliver / delete |
+| Manage | Click the `✎ ×N` chip at the right of the composer toolbar to open the sidebar "Annotations" tab: edit / delete / jump / redeliver / clear delivered / refresh |
+| Send | Just type and press enter. An injected-context line appears in the transcript — **your own bubble still contains only your own words** |
 
-## Strengths
+On the model side the `annotation` tool is available: `list` to re-read, `resolve` to mark as answered (especially useful once context has been compacted).
 
-- **Nothing can silently drop an annotation.** Delivery is decoupled from the
-  composer, from the transcript DOM and from keyboard timing — the three usual
-  causes of "I marked it but the model never saw it". "Delivered" is a *confirmed*
-  state, not an assumption: `agent/pre-step` only proposes the block, and the
-  annotations are marked delivered once the session log publishes the message
-  that carries it. A step stopped or failed before that point leaves them
-  pending, and the next message you send carries them again — and only a step
-  whose input is attributed to you takes them (0.7.0, see Limitations 7).
-- **Your own words stay your own.** The block is a separate injected-context
-  message; your bubble never grows text you did not type, and your message is
-  returned byte for byte.
-- **Zero intrusion.** No DSH core changes, no injected nodes inside messages, no
-  key interception.
-- **Readable model context.** One numbered block with quoted sources, and an
-  explicit instruction not to restate the quotes.
-- **Persistent and reviewable.** Annotations survive the send, the session and a
-  restart; the agent can re-read them on demand.
-- **Zero footprint when unused.** No annotations, no UI.
-- **Survives a reload.** Quotes are re-located through a whitespace-normalized
-  index, across node boundaries, in one pass over the document; each annotation
-  remembers the occurrence it was made on, so two annotations of one quote keep
-  their own spots.
-- **Fenced API.** Loopback `Host` plus a per-boot token that only the pages this
-  process served ever see.
+## Capabilities
+
+| Capability | Description |
+|---|---|
+| Non-invasive | Touches no file of DSH, injects no node into the message DOM, hijacks no keystroke (`Enter` is consumed only while the annotation editor has focus); with no annotations, nothing of this plugin is on screen |
+| Quote highlighting | Uses the **CSS Custom Highlight API** and never rewrites the rendered message node tree |
+| Cross-session persistence | Annotations live host-side, surviving sessions and restarts without polluting any workspace; the chip and sidebar list come back at once, and highlights and badges re-anchor by quote |
+| Session-stable numbering | Number 3 in the panel is `Annotation 3` in the model's reply — they never drift apart |
+| Deliver once | An annotation is marked delivered; a delivered one can be sent back to pending with **Redeliver** to ride the next message again |
+| Correct with repeated quotes | The quote's occurrence index is captured at creation time and persisted, and re-anchoring prefers it |
+
+## How it works
+
+```
+selection ─▶ annotations stored host-side ─▶ agent/pre-step appends a separate message ─▶ model answers by number
+                                                 └─ session/event confirms "delivered"
+```
+
+Delivery only counts a step whose received input is **attributed to you** (`source.kind`): an annotation added mid-turn is not picked up by the step already running, and neither automatic continuation rounds nor job notices consume it. **Delivery is confirmed only when that message actually reaches the session log** — abort before that and the annotations fall back to pending.
+
+Every extension point used is a documented DSH service or slot contract (`agent/pre-step`, `session/event`, `ctx.tools.register`, `webServer.register`, `shell.overlay`, `conversation.input.right`, `sidebar.right.pane.tab`, `ctx.locale`) — no upstream patching, so the blast radius on a DSH upgrade stays small.
+
+## Data and privacy
+
+| Item | Detail |
+|---|---|
+| Storage | `$DSH_HOME/annotations/annotations.json`, mode `0600`; written to a temp file then `rename`d, concurrent writes serialized |
+| Capacity | At most 400 per session; beyond that the oldest delivered annotations are cleaned first and pending ones are never dropped |
+| Length | Quote 2000 chars, note 4000 chars (truncated); request body capped at 512 KiB |
+| API auth | Loopback `Host` plus a one-time token minted per boot and injected only into pages this process serves |
+| Network | **No outbound requests at all** — it writes local files and serves the local browser only |
 
 ## Limitations
 
-1. **The block is a message of its own in the session log — not your words.**
-   It is appended as its own `user/message` event whose `source.kind` is
-   `dsh-annotate`, so the chat renders it as an injected-context row and **your
-   own bubble keeps only what you typed**; the `content` of your message is
-   returned untouched. The annotations themselves live in
-   `$DSH_HOME/annotations/annotations.json`, so restarting DSH and reopening the
-   session restores the chip, the sidebar list and every status; highlights and
-   badges re-locate by quote (and appear as the quoted message renders). That
-   layer is independent of delivery.
-   Delivery happens at `agent/pre-step`: the block is inserted right after the
-   `user/message` entering the step, and DSH appends every message of the step to
-   the log. The chat then decides how to draw an appended `user/message` by its
-   `source.kind` — `user` becomes your bubble, anything else becomes an
-   injected-context row (`@deepseek-ai/dsh-client-ui-chat`, `messageDefinition`
-   → `contextMessage`). So the block is logged and the model reads it, without
-   pretending to be your sentence.
-   This cannot be traded for "model-only, unlogged": DSH requires model-visible
-   content to use a logged channel, and `agent/pre-step` may only rewrite a
-   message that is about to be logged. A brand-new event type will not work
-   either, since a live `Session.append()` cannot set the `ignorable: true`
-   envelope that unknown stored events need, and a session holding one refuses
-   to reopen.
-   Two consequences worth knowing before you rely on it: (a) **deleting a
-   delivered annotation does not retract it from the transcript** — that text is
-   already a logged message, and deleting only removes the annotation record
-   with its badge and highlight; (b) **exporting, sharing or copying that session
-   carries the quoted text and your annotation notes with it.** The other way
-   round, regenerate/fork *does* show the block to the model again — and so does
-   **redeliver**, which deliberately sends a delivered annotation a second time.
-2. **Host-half edits need a restart** (see above).
-3. **Re-anchoring after a reload is quote-based, and now lazy:** a quote whose
-   message is not loaded yet is marked “source not in view” in the panel and is
-   located automatically once that message renders. The rest still applies. Badges and highlights rely on
-   a live `Range`; after a refresh the quote is relocated through a
-   whitespace-normalized full-text index, so selections spanning several text
-   nodes and whitespace differences both work. When one quote is annotated more
-   than once, **the occurrence each annotation was made on is captured at
-   creation time and persisted with the record** (0.6.0): the editor resolves “how
-   many occurrences lie entirely before this selection” from the live `Range`, the
-   value travels with the `create` request, the host stores it, and re-anchoring
-   and Jump to source prefer it. So annotating the *same* spot twice keeps both
-   annotations on that spot (both say 0), while two annotations made on two
-   different occurrences stay 0 and 1 — the 0.5.0 fix, unchanged. Records without
-   the field (written by 0.5.0 and older) fall back to a creation-order table
-   built **among those legacy records alone**: a record that knows its own
-   occurrence neither consumes a fallback ordinal nor pushes an older record
-   somewhere else. That fallback also has an **opposite** cost in a session that
-   mixes versions: with the quote present **twice**, a legacy record (no
-   `occurrence` field) that was made on the **second** occurrence is handed
-   ordinal 0 by the fallback table and silently lands on the **first** one —
-   0.5.0 behaved the same way with the same input, so this is not a 0.6.0
-   regression; deleting that annotation and re-creating it on the spot stores the
-   true ordinal. When the value cannot be resolved at creation (the node the
-   selection pointed at has been replaced by a re-render, say) nothing is stored
-   — a guessed ordinal is never persisted. A quote that is no longer in the
-   document at all (for example a message virtualized out of the transcript)
-   still cannot be located — the panel always keeps the full quote. Both 0.5.0
-   changes and this one have a drawing side that only a browser can confirm:
-   which occurrence a highlight and a badge land on, where Jump to source scrolls
-   to, and when the Redeliver button appears (delivered annotations only) plus the
-   state flow behind it — the suite pins the pure functions and the persisted
-   field, not the drawing.
-4. **Web only.** There is no TUI build.
-5. **Text only.** Text inside images or inside structured tool-call cards cannot
-   be selected.
-6. **Numbering is per session.**
-7. **Delivery only happens on the step that carries input attributed to you,
-   and the block rides that message in.** The verdict is taken from the batch the
-   step **claimed** — the input it is about to send — and asks whether any of it
-   carries `source.kind === 'user'`. That is attribution, not typing: `/plan
-   <text>` steers the text you just sent, `/goal` re-injects its attachments, a
-   replayed agent-teams slash command, and a subagent delegation prompt in the
-   child session all count, while automatic continuation rounds
-   (`source.kind === 'goal'`), background job notices (`tool-jobs`) and the
-   runtime context (`runtime-context`) do not. Cost: an annotation added **while a
-   turn is running** waits for your next message instead of riding the step the
-   model is already executing — it stays "pending" until then (the `annotation`
-   tool can still read it on demand), and no non-user step takes it away. If the
-   model is busy and your message is queued, the block rides that queued message
-   when it is processed; if the message is never processed, the annotations stay
-   "pending". Delivery is confirmed by the session log: `agent/pre-step` returns
-   before the loop's abort check and before `prepareRequest`, so an abort (or a
-   request that fails while being prepared) **before the block reaches the log**
-   means the message is never appended, the annotations go back to "pending" and
-   ride your next message. Once the block *is* in the log, a later abort does not
-   undo it: the record stays delivered, and a regression test pins that. The cost
-   is one narrow duplicate window — if the process exits after the block reached
-   the log but before the "delivered" status was written, those annotations still
-   read as pending next boot and are sent once more.
-8. **The local HTTP route is fenced, not private.** Two gates: the `Host` must be
-   loopback (DNS rebinding), and the request must carry a per-boot token that is
-   written only into the boot payload of pages this process served. A local
-   process running as the same user can still read
-   `~/.dsh/annotations/annotations.json` directly (mode `0600`).
-9. **Plaintext storage** (`0600`). Sensitive text pasted into a note stays in
-   `~/.dsh/annotations/` until you delete it.
-10. **Verified on Linux only.** The code uses `node:*` builtins and browser APIs,
-    so it should be portable, but macOS/Windows are untested.
-11. **Badge occlusion: a badge whose own box falls into the occlusion band is not
-    drawn at all (0.7.0).** The criterion is the **badge's own box** (`rect.top -
-    9`, 18 px tall), not the whole quote; a hit drops the entry entirely and the
-    coordinates are **never** moved — a nudged badge would read as an anchor
-    drift. Costs and known limits:
-    - once a quote's top has scrolled behind the composer (or above the
-      transcript head), that badge is not drawn for that scroll position and
-      cannot be clicked in the transcript until you scroll back — the sidebar tab
-      still offers jump / edit / delete / redeliver. Note that a quote merely
-      running *under* the composer while its badge stays clear **keeps** its badge:
-      0.7.0 deliberately tightened this so a partly covered quote does not lose a
-      badge that is not itself in the way;
-    - with an extreme window (header + composer height ≥ viewport height) the
-      band's two edges can invert; 0.7.0 then drops the head edge and keeps the
-      composer edge instead of inventing a second edge, so only a composer taller
-      than the viewport itself (its top edge above the viewport) hides **every**
-      badge — a known limitation;
-    - the drawing side **cannot be verified automatically**: the suite pins the
-      pure functions (both band edges and the 152 px fallback, the measured
-      scroller bottom, box/band intersection, the edge counting as outside, and
-      degenerate input never throwing). Check by hand in the browser: scroll a
-      quote behind the composer — the badge should disappear while the composer
-      stays clickable; scroll back — it should reappear in place, same number,
-      same spot; make the composer taller — the disappearing threshold should move
-      with it.
-    - the band depends on the host publishing `--dsh-composer-height` (on
-      `[data-conversation-scroll]`; when it cannot be read the host's own `152px`
-      default is used); the head edge needs that same container and is simply not
-      cropped when it cannot be measured — no header height is ever invented.
+1. **The annotation block is a separate message in the session log, not your words.** Your message's `content` is not changed by a single byte; the block renders as an injected-context line. Two consequences: **deleting a delivered annotation does not retract it from the transcript**, and **exporting or sharing that session carries the quotes and notes with it** (the plugin itself makes no outbound requests — it depends only on what you do with the session). Conversely, regenerating a reply makes the model see the block again.
+2. **Host-side changes need a restart.** `client.js` only needs a refresh; `index.js` needs `dsh web` restarted.
+3. **Re-anchoring after a refresh is quote-based.** Matching uses a whitespace-normalized full-text index, so selections spanning nodes and whitespace differences are recovered; a quote not present in the current page (virtualized away, say) is labelled "quote not in view" and filled in when you scroll to it. **The browser rendering surface cannot be verified automatically** — unit tests pin the pure functions and persisted fields only.
+4. **Platform and scope.** Web only (no TUI/terminal build); text only — text inside images and structured content in tool cards cannot be selected (plain text in tool output can); numbering is per session, each starting from 1 and not continuous across sessions.
+5. **Delivery happens only on a step that carries input attributed to you.** The test is whether the step's claimed input contains a message whose `source.kind === 'user'`, not whether you literally typed it. The cost: **an annotation added mid-turn waits for your next real message**. There is a narrow duplicate window — the block is already in the log but the process exits before writing "delivered", so it is sent once more on the next start.
+6. **Local data boundary.** Loopback `Host` plus the one-time token keep other pages and scripts on the same machine out; but **a local process running as the same user can still read the JSON file directly** — that is a file-permission boundary, outside this plugin's scope. Notes are stored in plaintext (`0600`); anything sensitive you paste stays in cleartext under `$DSH_HOME/annotations/` until you delete it by hand or from the panel.
+7. **Environment.** Highlighting needs the CSS Custom Highlight API (Chromium 105+); without it you simply lose the background tint and nothing else. The code uses only `node:*` and browser APIs, but it has **not been tested on macOS or Windows**.
+8. **Badge occlusion clipping.** When the badge itself would land in the composer (or conversation header) occlusion band, that badge is **not rendered at all and is never moved off its anchor** — you can still jump to, edit, delete or redeliver it from the sidebar tab. At extreme window sizes the band's two edges invert; the handling drops the header edge and keeps only the composer edge.
 
 ## Development
 
 ```sh
-node --check index.js && node --check client.js
-node --test                # 67 tests: delivery, authorization, anchoring, badge occlusion
+node --check index.js && node --check client.js   # syntax check
+node --test                                       # unit tests (auto-discovers test/)
 ```
 
-Do **not** pass `test/` to the runner. Node 22 resolves a positional argument as a
-module path and exits with `MODULE_NOT_FOUND`, while Node 20 and 26 expand it as a
-directory. With no arguments every version in the CI matrix discovers `test/`.
+> Do **not** pass `test/` as a path argument: Node 22 treats it as a module path to `require` and exits immediately.
 
-The anchoring tests exercise the shipped code: the core is marked `@pure-anchor`
-inside `client.js` and the test evaluates that exact slice, so there is no second
-copy of the algorithm to drift. That slice does not touch the DOM; mapping the
-live selection onto it (`segmentPositionOf` / `occurrenceOfRange`) is the only
-part of the creation-time capture that a unit test cannot reach.
-
-The badge-occlusion band is decided by pure functions inside that same
-`@pure-anchor` slice (`badgeBand` / `badgeBox` / `badgeVisibleIn`), so the tests
-pin the arithmetic — both band edges and the 152 px fallback, the measured
-scroller bottom, the badge box, and the degenerate inputs — while the visible
-result stays a browser check (Limitations 11).
-
-The host half imports only `node:*` builtins — a workspace-installed bundle
-cannot resolve `@deepseek-ai/*` packages at runtime. The browser half only
-requires `react` from the browser module table.
+CI runs on Node 20 and 22. The `anchor` suite tests **the shipped code itself**: the core functions are fenced in `client.js` under `@pure-anchor` and the tests evaluate that source directly, so there is no "green suite, different implementation in production" gap. For troubleshooting, look for the `[dsh-annotate]` prefix in the browser console — every interaction handler has a fallback that logs and shows a visible notice rather than failing silently.
 
 ## License
 
