@@ -1,6 +1,6 @@
 {
   "name": "dsh-annotate",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "Select text in the DSH Web transcript, annotate it, and the host delivers the annotations with the next message you send — the step whose input is attributed to you, never an automatic round or a job notice; the model answers them by number.",

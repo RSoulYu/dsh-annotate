@@ -4,6 +4,106 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-08
+
+### Fixed
+
+- **An annotation's number was a position recomputed on every read, not an
+  identity — so deleting one annotation, or pressing 【清空已送达】/"clear
+  delivered", silently renumbered every annotation that was still there.**
+  `numbering()` sorted the records by `createdAt` and handed out `1..N` over the
+  records that existed at that moment, while its own comment promised that
+  "Annotation 4" always means the same annotation and both READMEs promised the
+  panel's 3 is the model's `Annotation 3`. The browser half was already written
+  for a stored number — `allNumbers()` prefers `item.number` and only falls back
+  to the position — but nothing ever sent one: `normalizeRecord()` dropped the
+  field and `AnnotationStore.create()` never wrote it, so every projection
+  carried a freshly derived position: the browser half's `item.number` branch
+  held for every record (its condition was true every time), and the `index + 1`
+  fallback beside it was the branch that never ran.
+
+  A number is now **assigned once, at creation, and persisted with the record**,
+  next to `occurrence`:
+
+  - `normalizeRecord` keeps an optional `number` and accepts only a
+    `Number.isInteger(value) && value >= 1` (the same rule shape as the existing
+    `asOccurrence`; a string, a fraction, a zero, a negative, `NaN` or an object
+    becomes `undefined` and is cleaned off the record rather than trusted);
+  - `AnnotationStore.create` writes `max(every number the session already reads,
+    persisted and derived) + 1`, and `1` for an empty session — the new record is
+    not part of that maximum, so its own derived position cannot be skipped over;
+  - `numbering()` reports the stored value and derives a position only for
+    records that have none: in `createdAt` order each takes the smallest positive
+    integer no persisted number already owns (a duplicate value in a hand-edited
+    file cannot make two records read the same).
+
+  A session in which no record carries a persisted number is still numbered
+  `1..N` in creation order — byte for byte what 0.7.0 produced — and every
+  projection the host sends (`toClient`, all `handleApi` cases, the delivery
+  block, the `annotation` tool) keeps reading the number from `numbering()`, so
+  the wire shape is unchanged. `toClient` now carries the invariant the browser
+  half depends on: **every record of every projection reads a positive integer
+  `number`, never `undefined`** (all six browser-facing cases are pinned by a
+  test), so the badge, the popover and the sidebar always show the number the
+  delivered block means. The browser half's `allNumbers()` already preferred
+  `item.number`; its positional fallback was rewritten to apply this same
+  derivation instead of `index + 1`, because the two disagree in a mixed session
+  (stored #5 plus two legacy records: the smallest free positions are 1 and 2,
+  while `index + 1` would say 2 and 3 and point `Annotation 2` at the wrong
+  record) — a projection that did omit the field now degrades to the host's own
+  answer rather than to a different one.
+
+  Costs, deliberately accepted (the three the iteration brief names):
+
+  1. Numbers are **no longer contiguous** — delete number 1 and the survivors
+     still read 2 and 3; stable beats contiguous. They are also **not a
+     monotonically growing counter**: the value is `max(what the session still
+     reads) + 1`, so a session that keeps creating and deleting keeps its numbers
+     bounded instead of pushing them up forever. A number a surviving record still
+     reads is never handed to a new annotation, and reuse exists on exactly one
+     narrow edge — deleting the record that holds the session's **current
+     maximum** frees that number for the next annotation (delete 3 from 1, 2, 3
+     and the next annotation is 3 again; delete 2 and the next one is 4, so a
+     **non-maximum number is never reused**).
+  2. A record written before 0.8.0 carries no `number` on disk and still walks the
+     old positional path, so deleting an *earlier legacy* record still moves it
+     forward — the same trade 0.6.0 made for `occurrence` (old records keep the old
+     path). Deleting and re-creating such an annotation pins a real number.
+  3. **Reverting to a version before 0.8.0 wipes the persisted `number` values.**
+     The older `normalizeRecord` rebuilds every record from a fixed key set and
+     `flush` rewrites the whole document, so one write from an older host half
+     leaves the file without the field and those records fall back to positional
+     numbers. The same mechanism would later wipe any added per-session state (an
+     absolute no-reuse counter, for instance), which is one more reason this
+     release did not add one. Roll back only if you accept losing the numbering.
+
+  And, as with the fields before it, the drawing surface still cannot be verified
+  automatically: the suite pins the stored field, the pure numbering, the client
+  table and every API projection, so the visible result needs a browser check by
+  hand — create three annotations, delete the first one, and the two remaining
+  badges must still read 2 and 3 (the next message's block must say `编号 2、3`,
+  not `编号 1、2`).
+
+### Changed
+
+- The `annotation` tool now reports `revision: 9` (`REVISION` 8 → 9).
+- `package.json` version, both READMEs' version badge: `0.7.0` → `0.8.0`. Both
+  READMEs' numbering row now says the number is **allocated at creation and
+  persisted** (so it cannot drift when other annotations are deleted or the
+  delivered ones are cleared), and the limitation that lists what is per session
+  spells out the three costs above: numbers stop being contiguous (and are not a
+  counter that grows without bound), a surviving record's number is never handed
+  to a new annotation (the freed current maximum is the one exception), records
+  written before 0.8.0 keep the positional path, and rolling back to 0.7.0 or
+  older erases the stored numbers.
+- Why **0.8.0** and not a patch: this adds a new optional persisted identity
+  field to the stored document, which is exactly what 0.6.0 did for `occurrence`
+  — and that release went minor. The stored shape gains an optional key, and the
+  numbers a session reads change for any session that mixes records from both
+  versions (they skip values instead of counting), both observable to a reader.
+
+[0.8.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.7.0...v0.8.0
+
 ## [0.7.0] - 2026-10-07
 
 ### Fixed

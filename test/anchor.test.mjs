@@ -462,6 +462,62 @@ test('the badge builder judges the drawn box and keeps the out-of-view filter', 
   assert.doesNotMatch(body, /rect\.top - 9|rect\.left - 11/, 'no second copy of the offsets to drift from')
 })
 
+/* ------------------------------------- session-stable numbering (0.8.0) --- */
+
+test('allNumbers uses the number the host persisted instead of the position', () => {
+  const body = sourceOf('allNumbers')
+  const numbersOf = (annotations) => new Function('store', `${body}\nreturn allNumbers`)({ annotations })()
+
+  // 0.8.0 assigns a number once, at creation, and persists it, so a survivor
+  // keeps its identity when an earlier annotation is deleted: 1 and 5 must stay
+  // 1 and 5 rather than slide to 1 and 2. This is the badge half of the
+  // "session-stable numbering" promise (the host half is pinned in
+  // test/host.test.mjs), and it holds because every record the client ever holds
+  // comes from a host projection, which always carries the field.
+  assert.deepEqual(
+    {
+      ...numbersOf([
+        { id: 'a', createdAt: 100, number: 1 },
+        { id: 'b', createdAt: 200, number: 5 },
+      ]),
+    },
+    { a: 1, b: 5 },
+  )
+
+  // A record without the field keeps the fallback — and that fallback is the
+  // host's own derivation, not `index + 1`. This is the fixture the contract
+  // names as the counterexample: a stored 5 plus two legacy records means the
+  // positions 1 and 2, so the panel and the delivered block agree; `index + 1`
+  // would have said 2 and 3 and pointed `Annotation 2` at the wrong record.
+  assert.deepEqual(
+    {
+      ...numbersOf([
+        { id: 'stored', createdAt: 100, number: 5 },
+        { id: 'l1', createdAt: 200 },
+        { id: 'l2', createdAt: 300 },
+      ]),
+    },
+    { stored: 5, l1: 1, l2: 2 },
+  )
+
+  // A malformed or duplicated value is not an identity: it is ignored and the
+  // record takes a free position instead (the host would not send one; the field
+  // is optional), and two records never read the same number.
+  assert.deepEqual({ ...numbersOf([{ id: 'a', createdAt: 100, number: '3' }]) }, { a: 1 })
+  assert.deepEqual({ ...numbersOf([{ id: 'a', createdAt: 100, number: 1.5 }]) }, { a: 1 })
+  assert.deepEqual(
+    {
+      ...numbersOf([
+        { id: 'first', createdAt: 100, number: 2 },
+        { id: 'second', createdAt: 200, number: 2 },
+      ]),
+    },
+    { first: 2, second: 1 },
+  )
+  // A session with no stored number at all is still 1..N in creation order.
+  assert.deepEqual({ ...numbersOf([{ id: 'a', createdAt: 100 }, { id: 'b', createdAt: 200 }]) }, { a: 1, b: 2 })
+})
+
 test('the badge overlay keeps its float contract and reads both measured edges', () => {
   const badges = sourceOf('Badges')
   assert.match(badges, /pointerEvents: 'none'/, 'the overlay stays click-through')

@@ -343,14 +343,46 @@ window.__ModuleLoader__.load({
 
     /* -------------------------------------------------------- anchoring */
 
+    /**
+     * The number each of this session's annotations reads, by id.
+     *
+     * Since 0.8.0 the host assigns a number once, at creation, and persists it;
+     * every projection it sends carries the field, so a record that has one keeps
+     * it (`item.number`). This is the same rule the host's own `numbering()`
+     * applies, on purpose: in a session that mixes stored numbers with older
+     * records the two must agree, or the panel would show a number the delivered
+     * `Annotation N` block does not mean.
+     *
+     * A record WITHOUT a usable number — anything written before 0.8.0, or a
+     * projection from a host half that does not send the field — takes the
+     * smallest positive integer the stored numbers do not already own, walking
+     * creation order and reserving each value as it is handed out. Falling back
+     * to `index + 1` here would disagree with that: stored #5 plus two legacy
+     * records gives the positions 1 and 2, while `index + 1` would say 2 and 3.
+     *
+     * @returns an id → number table (no prototype, so an id cannot collide with
+     *   an `Object.prototype` member).
+     */
     function allNumbers() {
-      // Stable numbering: creation order among this session's annotations.
       var ordered = store.annotations.slice().sort(function (a, b) {
         return a.createdAt - b.createdAt
       })
       var numbers = Object.create(null)
-      ordered.forEach(function (item, index) {
-        numbers[item.id] = Number.isFinite(item.number) && item.number > 0 ? item.number : index + 1
+      var taken = Object.create(null)
+      ordered.forEach(function (item) {
+        var value = item.number
+        // The host's own acceptance rule: an integer of at least 1, nothing else.
+        if (typeof value !== 'number' || !Number.isFinite(value) || value < 1 || Math.floor(value) !== value) return
+        if (taken[value] === true) return
+        numbers[item.id] = value
+        taken[value] = true
+      })
+      var next = 1
+      ordered.forEach(function (item) {
+        if (numbers[item.id] !== undefined) return
+        while (taken[next] === true) next += 1
+        numbers[item.id] = next
+        taken[next] = true
       })
       return numbers
     }

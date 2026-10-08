@@ -88,7 +88,7 @@ export const inject = ['tools']
  * re-activated; the tool reports this value so "which revision is live" is
  * answerable without a restart-and-guess.
  */
-const REVISION = 8
+const REVISION = 9
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
 /**
@@ -141,6 +141,22 @@ function asOccurrence(value) {
 }
 
 /**
+ * Keep a stored annotation number only when it is an integer of at least 1.
+ *
+ * The field is optional (records written before 0.8.0 do not carry it) and the
+ * stored file is not trusted either: a string, a fraction, a zero, a negative or
+ * `NaN` is dropped to `undefined` so {@link numbering} falls back to the position
+ * of that record instead of labelling it with a nonsense value. Never throws.
+ *
+ * Written exactly like {@link asOccurrence} on purpose: the two optional
+ * identity fields share one acceptance rule shape, so a reader only has to learn
+ * it once.
+ */
+function asNumber(value) {
+  return Number.isInteger(value) && value >= 1 ? value : undefined
+}
+
+/**
  * Resolve the Session id from an agent handle. The event contract exposes
  * `agent.id`, but the live Agent also carries `agent.session.id`; prefer
  * whichever looks like a session id so a contract change degrades to the
@@ -177,6 +193,7 @@ function normalizeRecord(raw) {
     deliveredTurn: Number.isFinite(raw.deliveredTurn) ? raw.deliveredTurn : undefined,
     origin: raw.origin === 'user' ? 'user' : 'assistant',
     occurrence: asOccurrence(raw.occurrence),
+    number: asNumber(raw.number),
   }
 }
 
@@ -269,9 +286,23 @@ class AnnotationStore {
   }
 
   async create(input) {
+    const sessionId = asId(input.sessionId)
+    if (sessionId.length === 0) throw new Error('sessionId is required')
+    // Assign the number ONCE, here, before the record joins the list: it is an
+    // identity, not a position. It must clear every number this session already
+    // reads — the persisted ones and the derived ones of older records alike —
+    // so a newcomer can never re-label an annotation that already has one. The
+    // new record is deliberately not part of the maximum: its own number is
+    // still undefined, and the derived pass would otherwise hand it a position
+    // (the smallest free one) that the increment then skips over.
+    const existing = this.state.annotations.filter((item) => item.sessionId === sessionId)
+    const numbers = numbering(existing)
+    let highest = 0
+    for (const item of existing) highest = Math.max(highest, numbers.get(item.id) ?? 0)
     const record = normalizeRecord({
       id: `ann-${randomUUID()}`,
-      sessionId: input.sessionId,
+      sessionId,
+      number: highest + 1,
       quote: input.quote,
       note: input.note,
       origin: input.origin,
@@ -372,15 +403,55 @@ class AnnotationStore {
 /* ------------------------------------------------------- delivery rendering */
 
 /**
- * Stable per-session numbering: creation order. The panel, the badges and the
- * reply markers all use these numbers, so "Annotation 4" always means the same
- * annotation.
+ * Stable per-session numbering: the numbers the panel, the badges and the reply
+ * markers all read, so "Annotation 4" always means the same annotation.
+ *
+ * Since 0.8.0 a number is assigned **once**, when the record is created, and
+ * persisted with it ({@link AnnotationStore.create}); this function only reports
+ * it. The stored value wins, so deleting another annotation or clearing the
+ * delivered ones never moves a surviving record's number.
+ *
+ * A record written before 0.8.0 has no number, and a stored value that is not a
+ * valid number is dropped on load; those records are numbered by position: in
+ * `createdAt` order each takes the SMALLEST positive integer that no persisted
+ * number already owns. A session in which no record carries a persisted number
+ * is therefore still numbered 1..N in creation order — byte for byte what 0.7.0
+ * produced — and a record that does carry one never consumes a fallback value
+ * that belongs to an older record.
+ *
+ * A surviving record's number never changes, and a new annotation never takes a
+ * number a surviving record still reads — it takes `max(what still reads) + 1`.
+ * The numbering is therefore not a monotonically growing counter, and reuse
+ * happens on exactly one narrow edge: deleting the record that holds the
+ * CURRENT maximum frees that number for the next annotation (delete 3 from
+ * 1, 2, 3 and the next annotation is 3 again; delete 2 and the next one is 4, so
+ * a NON-maximum number is never reused). Numbers do stop being contiguous in a
+ * session where something was deleted: stable beats contiguous.
+ *
  * @param {Array<any>} records every record of one session.
  * @returns {Map<string, number>}
  */
 function numbering(records) {
   const ordered = records.slice().sort((a, b) => a.createdAt - b.createdAt)
-  return new Map(ordered.map((record, index) => [record.id, index + 1]))
+  const numbers = new Map()
+  const taken = new Set()
+  for (const record of ordered) {
+    const stored = asNumber(record.number)
+    // A duplicate — a hand-edited file, say — must not make two records read the
+    // same: the first one in creation order keeps the value and the rest fall
+    // back to a free position, so every record still gets exactly one number.
+    if (stored === undefined || taken.has(stored)) continue
+    numbers.set(record.id, stored)
+    taken.add(stored)
+  }
+  let next = 1
+  for (const record of ordered) {
+    if (numbers.has(record.id)) continue
+    while (taken.has(next)) next += 1
+    numbers.set(record.id, next)
+    taken.add(next)
+  }
+  return numbers
 }
 
 /**
