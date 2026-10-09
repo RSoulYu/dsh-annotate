@@ -2,7 +2,7 @@
 
 **在 DSH Web 的对话里选中一段文字加批注，它随你下一条消息一起交给模型，模型按编号逐条回应。**
 
-[![ci](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml/badge.svg)](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![version](https://img.shields.io/badge/version-0.9.0-green.svg)](CHANGELOG.md)
+[![ci](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml/badge.svg)](https://github.com/RSoulYu/dsh-annotate/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![version](https://img.shields.io/badge/version-0.10.1-green.svg)](CHANGELOG.md)
 
 **简体中文** | [English](README.en.md) · [CHANGELOG](CHANGELOG.md)
 
@@ -74,7 +74,7 @@ dsh plugin --profile <profile> remove dsh-annotate    # 卸载
 
 1. **批注块是日志里的独立消息，但不是你的话。** 你那条消息的 `content` 一个字节都没被改，转录里渲染成注入上下文行。两个后果：**删掉一条已送达批注不会把它从转录里撤回**；**导出或分享该会话会一起带走批注原文与内容**（插件自身零外发，只取决于你拿这条会话做什么）。反过来，回复点「重新生成」时模型会再看到它一遍。
 2. **Host 半的改动需要重启才生效。** 改 `client.js` 刷新即可，改 `index.js` 必须重启 `dsh web`。
-3. **刷新后靠引文重新定位。** 按空白归一化的全文索引重新匹配，跨节点选区与空白差异都能找回；引文在当前页面不存在时（如所在消息还在已加载事件窗口之外）标为「原文未在视图中」，滚动到时自动补上。**「跳回原文」**在这种时候会先把更早的历史加载进来再落位（0.10.0）；仍不可达时给出 5 种持久原因之一并在 `data-dsa-jump` 上标明，按钮保持可点重试。**浏览器绘制面无法自动验证**——单测只钉得住纯函数、判定表与持久化字段。
+3. **刷新后靠引文重新定位。** 按空白归一化的全文索引重新匹配，跨节点选区与空白差异都能找回；引文在当前页面不存在时（如所在消息还在已加载事件窗口之外）标为「原文未在视图中」，滚动到时自动补上。**「跳回原文」**在这种时候会先把更早的历史加载进来再落位（0.10.0）；仍不可达时给出 5 种持久原因之一并在 `data-dsa-jump` 上标明，按钮保持可点重试。**浏览器布局/绘制面仍无法自动验证**——jsdom 没有排版，几何位置与高亮绘制只能靠真机；但**组件渲染路径**自 0.10.1 起由 `test/popover-render.test.mjs` 用真实 React 断言，0.10.0 那种「点开徽标整块 overlay 崩成 `批注插件出错：…`」不会再无声出货。
 4. **跳转有上限，越老的批注越慢。** 一次跳转最多向宿主请求 60 页（每页至少 50 条消息），连续 3 次请求后窗口仍无进展就停下并如实报告「宿主没有返回更早的历史」；等待在途页与重复揭示各自的帧预算也在有限帧内结束（分别报 `stalled` 与 `folded`），不会无限等。这是宿主公开动词决定的上限，不是为了快而去猜坐标：插件不新增依赖、不猜宿主内部 DOM 属性、不用 `loadThrough` 猜一个事件序号。**原文已经加载在页面里时不需要宿主**：这种情况直接滚动到原文，宿主会话服务缺失也照样跳得过去。
 5. **仍可能跳不过去的场景（都会有持久原因，不会静默无动作）。** 原文在另一个视图（对话/轨迹）里；原文已被编辑或被上下文压缩删除；原文在宿主的折叠块里而平台的揭示事件没生效（`failed:folded`）；宿主没有提供会话服务（`failed:no-session`）；窗口长时间既忙又无进展（`failed:stalled`）；还有更早历史没加载完就用光了这一轮的页预算（`failed:budget`，再点一次会从已扩大的窗口接着找）。这几种状态下该行保留原因文案、按钮可点重试，元素上带 `data-dsa-jump="failed:<原因>"` 与 `data-dsa-jump-pages`。
 6. **平台与范围。** 只支持 Web（无 TUI/终端版本）；只处理文本，图片里的文字与工具调用卡片内的结构化内容不能选中（工具输出里的纯文本可以）。编号按会话独立，每个会话的第一条批注是 1，跨会话不连续。编号是**创建时分配、此后不再改变**的身份：删掉一条批注或点【清空已送达】，都不会让还存在的批注改号（于是编号**不再连续**）。新编号取「现存最大号 + 1」——它不是永不回头的计数器，所以反复增删的会话不会把编号无限推高；也绝不会与**仍存在**的批注撞号，唯一会回到池子里的历史号，是被删掉的恰为当时**最大号**的那个（从 1、2、3 里删 3，下一条又拿到 3；删 2 则下一条是 4，**非最大号永不复用**）。**0.8.0 之前写入、没有 `number` 字段的旧记录在插件启动时补号落盘**——补的就是它当时按位置读到的号，所以删除更早的旧记录不再让后面的前移；补号只发生一次，补号前自动在同一目录留一份备份，补号失败时这次启动不写盘、下次启动重试。另有一条回退代价：**装回 0.8.0 之前的版本会把已落盘的 `number` 抹掉**（老版本的记录按固定键集重建、落盘又整份重写），那些批注会退回位置编号；装回 0.8.0 会保留已补的号，但不会再补新出现的旧记录，重新装回 0.9.0 时会再补一次（已存在的备份不会被覆盖）。
@@ -87,6 +87,7 @@ dsh plugin --profile <profile> remove dsh-annotate    # 卸载
 
 ```sh
 node --check index.js && node --check client.js   # 语法检查
+npm install --no-save --no-package-lock react@18.3.1 react-dom@18.3.1 jsdom@24   # 渲染防线的依赖，只落 node_modules
 node --test                                       # 单测（自动发现 test/）
 DSH_ANNOTATE_HOST_ROOT=/usr/lib/node_modules/@deepseek-ai/dsh node --test   # 严格跑宿主形状断言
 node --import ./test/freeze-clock.mjs --test      # 冻结 Date.now() 再跑一次
@@ -95,6 +96,8 @@ node --import ./test/freeze-clock.mjs --test      # 冻结 Date.now() 再跑一�
 > 单测命令**不要带 `test/` 路径参数**：Node 22 会把它当模块路径去 `require` 而直接退出。
 
 CI 在 Node 20 与 22 上各跑一遍。`anchor` 那组测的是**出货代码本身**：核心函数用 `@pure-anchor` 标记在 `client.js` 里圈出，测试取出源码直接求值，不会出现「测试全绿但线上是另一份实现」——跳转的判定表与驱动在同一片标记区里，因此同样按出货代码断言。`jump` 那组覆盖三条路径、5 个失败原因、在途页（宿主 `loadingOlder === true` 时 `loadOlder()` 是静默 no-op，因此只能等）与预算上限；新增逻辑不读墙钟，所以冻结 `Date.now()` 的那一次必须与常规运行结果一致。
+
+`popover-render` 那组是**渲染防线**（0.10.1 起）：它把 `client.js` 的整个 factory body 求值（只换掉最后那句 `return { inject: … }`），用宿主浏览器实际加载的 react/react-dom 18.3.1 在 jsdom 里挂载真正的 `Overlay`，再走插件自己的 `togglePopover` 开关浮层三轮——0.10.0 那个「点开徽标整块 overlay 崩成 `批注插件出错：…`」的 #310 就在这条路径上，只断言源码的用例永远看不见它（hook 顺序错误是第二次渲染才存在的事实）。第二个用例是**变异对照**：同一套 harness 把 hook 移回早退之后，必须复现原来那行崩溃，否则这条防线只证明「React 没对当前文件抱怨」。依赖缺失会**显式失败**；唯一的非验证路径是 `DSH_ANNOTATE_RENDER=absent`，它打印 `popover render check: skipped by DSH_ANNOTATE_RENDER=absent`，不得当作已验证；CI 里这三个依赖由 workflow 安装，紧随其后的一步会检查本轮日志里确实有 `popover render check: verified with react 18.3.1 …`。
 
 `host-shape` 那组是一道**机械防线**：用例直接读宿主已发布源码，断言跳转依赖的公开形状（`ctx.sessions`、`binding`/`session`/`eventSource`、`loadOlder()`、`openState`/`hasMore`/`loadingOlder`、`revision`，以及「对话记录里没有 `IntersectionObserver`」「chat 不消费 `viewRequest`」两条负向事实）。宿主改了形状就**显式失败**，不会继续绿；宿主缺失同样失败。唯一的非验证路径是显式 `DSH_ANNOTATE_HOST_ROOT=absent`（GitHub CI 上无宿主，workflow 里显式设置），它会打印 `host shape check: skipped by DSH_ANNOTATE_HOST_ROOT=absent`，**不得**当作已验证。排障看浏览器 Console 的 `[dsh-annotate]` 前缀日志——交互处理器都有兜底，出错会打印并弹可见提示，不会静默失败。
 

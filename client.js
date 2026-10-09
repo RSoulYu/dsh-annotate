@@ -2497,23 +2497,31 @@ window.__ModuleLoader__.load({
     function BadgePopover() {
       useStore()
       var popover = store.popover
-      if (popover === null) return null
       var annotation = null
-      for (var i = 0; i < store.annotations.length; i += 1) {
-        if (store.annotations[i].id === popover.id) { annotation = store.annotations[i]; break }
+      if (popover !== null) {
+        for (var i = 0; i < store.annotations.length; i += 1) {
+          if (store.annotations[i].id === popover.id) { annotation = store.annotations[i]; break }
+        }
       }
-      if (annotation === null) return null
-      var numbers = allNumbers()
+      // Every hook runs before the first early return. Returning first and then
+      // calling a hook is what React answers with "Rendered more hooks than
+      // during the previous render" (minified error #310): the closed popover
+      // rendered two hooks, the open one rendered three, and the thrown error
+      // replaced the whole overlay with the crash line. The id is captured up
+      // here so the effect itself stays unconditional.
+      var annotationId = annotation === null ? null : annotation.id
       // Same rule as the panel row: closing the surface that shows a running
       // jump abandons that jump, and only that one.
       React.useEffect(
         function () {
           return function () {
-            if (jumpOf(annotation.id) !== null) clearJump()
+            if (annotationId !== null && jumpOf(annotationId) !== null) clearJump()
           }
         },
-        [annotation.id],
+        [annotationId],
       )
+      if (popover === null || annotation === null) return null
+      var numbers = allNumbers()
       return h(
         'div',
         {

@@ -4,6 +4,75 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-10-09
+
+### Fixed
+
+- **Clicking a numbered badge crashed the whole annotation overlay with React
+  error #310 — "Rendered more hooks than during the previous render".** 0.10.0
+  added the "closing this surface abandons a running jump" effect to
+  `BadgePopover` and placed it *after* the component's two early
+  `return null`s. The closed popover rendered two hooks (`useStore`'s
+  `useState` + `useEffect`); the frame that opened it rendered three. React
+  threw, the plugin's own `Boundary` caught the throw, and its fallback — the
+  visible `批注插件出错：…` line — replaced the entire overlay: from the first
+  badge click until the page was reloaded, the badges, the selection toolbar,
+  the editor, the popover and the toast were all gone.
+
+  Every hook now runs before the first early return, and the annotation id is
+  captured up front so the effect itself stays unconditional. The abandon
+  semantics are unchanged: a popover that closes or switches annotation cancels
+  that annotation's jump, and only that one.
+
+  No suite saw it because none of them rendered a component. The jump suites
+  evaluate `new Function` slices of `client.js` and drive `runJump` through
+  their own dependencies; `anchor` evaluates marked pure functions; `host` and
+  `host-shape` assert persisted fields and host shapes. A hook-order error only
+  exists as a *second* render, so nothing short of mounting the component could
+  fail on it.
+
+### Added
+
+- **`test/popover-render.test.mjs` — the render fence this bug needed.** It
+  evaluates the whole factory body of `client.js` (only the final
+  `return { inject, … }` is replaced by a probe return), mounts the real
+  `Overlay` with the real `react`/`react-dom` the host's browser module table
+  serves (18.3.1, the version the DSH web profile pins) inside a real DOM
+  (jsdom), and drives the plugin's own `togglePopover` entry point through three
+  open/close rounds. It asserts that the popover surface renders while open and
+  not while closed, that no frame reaches the crash boundary, and that React
+  reports no change in hook order. Its second case is a mutation control: the
+  same harness moves the hook back behind the early return in those bytes and
+  must then reproduce the exact `批注插件出错：Rendered more hooks …` line — so a
+  green run cannot mean "the harness stopped looking".
+
+  The three dependencies are deliberately **not** in `package.json`: install
+  them beside the checkout with
+  `npm install --no-save --no-package-lock react@18.3.1 react-dom@18.3.1 jsdom@24`.
+  The plugin keeps its zero-dependency manifest and the host profile never
+  receives them. A missing dependency **fails** the suite; the only
+  non-verifying path is the explicit `DSH_ANNOTATE_RENDER=absent`, which prints
+  `popover render check: skipped by DSH_ANNOTATE_RENDER=absent` and must never
+  be quoted as a verification. CI installs the three before the test step, and a
+  following step fails the job unless that run printed
+  `popover render check: verified with react 18.3.1 …`.
+
+### Verification
+
+- **A/B counter-proof, real renderer, shipping bytes.** Alternating 12 runs
+  against `f9b9aa0` (0.10.0) and the fixed worktree: the shipping 0.10.0 bytes
+  crashed on the open-popover frame **12/12** with
+  `批注插件出错：Rendered more hooks than during the previous render.` and React's
+  own diff (`1. useState / 2. useEffect / 3. undefined → useEffect`); the fixed
+  bytes crashed **0/12** and rendered `[data-dsa-ui="popover"]` in every open
+  frame and nothing in every closed one. Harness:
+  `.dsh-annotate-render/verify.mjs` (react 18.3.1 + react-dom 18.3.1 + jsdom
+  24.1.3); log: `.dsh-annotate-render/EVIDENCE.md`. The one environment
+  stand-in is jsdom's missing `ResizeObserver`, which the plugin only uses while
+  wiring listeners in `apply()` — a path that harness does not call.
+- The repository suite is 150/150 locally (host shape fence included, DSH host
+  present), stable over repeated runs.
+
 ## [0.10.0] - 2026-10-09
 
 ### Fixed

@@ -31,6 +31,16 @@ jobs:
       - name: Manifest sanity
         run: node -e "const p=require('./package.json'); if(!p.dsh?.bundle?.patch||!p.dsh?.client) { throw new Error('dsh manifest incomplete') }; console.log(p.name, p.version)"
 
+      - name: Render-harness dependencies
+        # The crash this fence exists for (React #310, "Rendered more hooks than
+        # during the previous render") is invisible to any source-only
+        # assertion: it needs a real renderer. These three are installed with
+        # --no-save/--no-package-lock on purpose — the plugin keeps its
+        # zero-dependency manifest, the host profile never receives them, and
+        # they exist only in this runner's node_modules. The versions match what
+        # the DSH web profile serves (react 18.3.1).
+        run: npm install --no-save --no-package-lock --no-audit --no-fund react@18.3.1 react-dom@18.3.1 jsdom@24
+
       - name: Host-half tests
         # No path argument on purpose. Node 22 resolves a positional argument as
         # a module path, so `node --test test/` dies with MODULE_NOT_FOUND;
@@ -68,5 +78,17 @@ jobs:
         run: |
           if ! grep -F 'host shape check: skipped by DSH_ANNOTATE_HOST_ROOT=absent' test-output.txt; then
             echo "::error::the host shape fence produced no skip line and no verification line"
+            exit 1
+          fi
+
+      - name: Render fence must be visible
+        # Symmetric with the host-shape step above, and the reason the render
+        # deps are installed: a run that skipped the render fence, or never got
+        # as far as printing which renderer it verified with, must not read as
+        # "green and verified". No opt-out is set here, so the fence either ran
+        # or the job already failed in the step above.
+        run: |
+          if ! grep -F 'popover render check: verified with react 18.3.1' test-output.txt; then
+            echo "::error::the render fence produced no verification line"
             exit 1
           fi
