@@ -4,6 +4,105 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-10-09
+
+### Fixed
+
+- **“Jump to source” did nothing when the quoted message was not in the page yet:
+  it showed one toast and stopped.** The path now really jumps — the plugin asks
+  the host for earlier history through the host's own public paging call and then
+  lands on the quote. The transcript does not unmount messages by viewport (it
+  renders every entry of the loaded event window into the DOM), so “the quote is
+  not on the page” means its message is still above the loaded event window.
+
+  - Loaded ⇒ scroll straight to the quote (byte-for-byte the 0.9.0 behaviour,
+    including its refusal to accept a zero-box range).
+  - Not loaded, but the host still has older history ⇒
+    `ctx.sessions.binding(sessionId).session.loadOlder()` (the same call the
+    host's own “load earlier” button makes) plus
+    `session.getSnapshot()`'s `openState` / `hasMore` / `loadingOlder` and the
+    event window's `revision` as the progress signal. The binding is resolved
+    fresh on every jump and never cached: a binding is tied to one generation of
+    a session, and a retained one would page the previous session.
+  - Not loaded and not locatable ⇒ a **persistent** failure state: the row keeps
+    the specific reason (the host provides no session / all loaded history was
+    searched and the quote is not there / older history remains unloaded / the
+    host returned no older history / the quote is inside a collapsed block), the
+    button stays usable for a retry, and the element carries
+    `data-dsa-jump="failed:<reason>"` with `data-dsa-jump-pages`. The toast still
+    appears once, but it is no longer the only signal.
+  - `loadOlder()` is a silent no-op while the host reports `loadingOlder === true`,
+    so the loop reads `getSnapshot().loadingOlder` first and waits instead of
+    re-requesting at full speed; the wait carries its own frame budget
+    (two page-waits' worth of frames, `JUMP_TICKS_PER_PAGE × 2`), so a window
+    that stays busy and silent reports `stalled` rather than waiting forever.
+    The frozen decision table still judges `loadingOlder` before the stall
+    counter — the budget is a bound on the phase that table cannot bound, not a
+    change to the table — and the reveal phase carries one of the same kind
+    (`JUMP_REVEAL_TRIES`), so repeated reveals that draw nothing end in `folded`.
+    Both budgets are departures from the frozen design's §4.4 wording, approved by
+    the captain's ruling (`RULING.md`, supplementary rulings 4 and 6): the
+    decision table's eight branches, their order, the three constants and the
+    five reason values are all unchanged, and the report records what departed,
+    why, and who approved it.
+  - Budgets: at most 60 pages per jump (`budget`), and three requests in a row
+    without a window change is `stalled`. The new logic reads no wall clock — the
+    budget is pages / stalls / frames — so a frozen `Date.now()` produces the
+    same run.
+  - A quote that is **already loaded and drawn** is scrolled to without asking
+    the host for anything. A session service that is missing, unbindable or not
+    open therefore costs nothing in that case — the mount-independent first step
+    of the decision table runs before any host access, exactly as in 0.9.0 — and
+    is reported as `no-session` only when older history really would have to be
+    loaded.
+
+### Changed
+
+- **No persistent field is added**: `index.js` is unchanged, and a record is
+  still `{ id, sessionId, quote, note, status, createdAt, updatedAt,
+  deliveredAt, deliveredTurn, origin, occurrence, number }`. There is therefore
+  no migration and no legacy-record fallback branch. The only new state is a
+  runtime one, `store.jump = { id, gen, phase, reason, pages }`, kept beside
+  `store.toast` and never written to disk.
+- While a jump runs, the row shows “loading earlier messages…” and its button is
+  disabled against re-entry; both are restored when the jump settles.
+
+### Added
+
+- **Host-shape assertions** (`test/host-shape.test.mjs`, 22 entries copied
+  verbatim plus one anchored addition, H23). The suite reads the host's own
+  source (`root = DSH_ANNOTATE_HOST_ROOT ?? the deployment path`) and asserts the
+  public shapes the jump depends on: `ctx.sessions` in the client API catalogue,
+  the `binding` / `session` / `eventSource` signatures, `loadOlder()`,
+  `openState` / `hasMore` / `loadingOlder`, `revision`, and two negative facts
+  (the transcript holds no `IntersectionObserver`, and the chat view never reads
+  `viewRequest`). The frozen list is not reworded; H23 is added because H21's
+  substring occurs 43 times in the runner bundle and therefore cannot notice one
+  slot losing `sessionId`: H23 anchors the same assertion to the
+  `sidebar.right.pane.tab` entry itself. If the host changes shape the suite
+  fails loudly instead of staying green. A missing host root also fails; the only
+  non-verifying path is an explicit `DSH_ANNOTATE_HOST_ROOT=absent`, which must
+  print `host shape check: skipped by DSH_ANNOTATE_HOST_ROOT=absent`. GitHub CI
+  runs without a host and sets that variable in the workflow; release evidence
+  uses a local strict run instead (23/23 assertions, exit 0).
+- **`test/jump-bytes.test.mjs` drives the SHIPPING bytes.** The other jump suite
+  evaluates `new Function` slices of `client.js` and hands `runJump` its own
+  dependencies, so it never executed `jumpDeps` / `executeJump` / `jumpTo` — and
+  the 0.10.0 development round shipped a `loadOlder` collaborator that called an
+  undefined identifier while that suite stayed green. This suite evaluates the
+  whole factory body (only the final `return { inject: … }` is replaced by a
+  probe return) and asserts on the real wiring: with the quote outside the
+  loaded window and `hasMore === true`, the host's `loadOlder()` is called at
+  least once and the run then lands or reports its reason; a mounted quote jumps
+  with no session service at all; a busy window is waited on and never
+  re-requested; the page and reveal budgets terminate. A mutation back to the
+  broken shape turns it red — see `.dsh-annotate-jump/reverse-proofs.mjs`.
+- `test/jump.test.mjs`: the three paths, the five failure reasons, the in-flight
+  trap (a busy window is never re-requested), the stall and page budgets, the
+  session-switch abort and the missing-service degradation — all asserted against
+  the frozen decision table.
+- `test/freeze-clock.mjs`: the `Date.now()`-frozen run.
+
 ## [0.9.0] - 2026-10-09
 
 ### Fixed

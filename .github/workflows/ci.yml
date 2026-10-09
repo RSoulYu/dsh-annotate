@@ -36,6 +36,18 @@ jobs:
         # a module path, so `node --test test/` dies with MODULE_NOT_FOUND;
         # Node 20 and 26 expand it as a directory. Without arguments the runner
         # discovers `test/**` on every version in the matrix.
+        #
+        # DSH_ANNOTATE_HOST_ROOT=absent is the ONE explicit opt-out for the host
+        # shape fence (test/host-shape.test.mjs). A GitHub runner has no DSH
+        # installation, so the fence cannot be verified here; the variable says
+        # so out loud and the suite prints
+        #   host shape check: skipped by DSH_ANNOTATE_HOST_ROOT=absent
+        # into this log. Without the variable a missing host root is a FAILURE,
+        # never a silent pass — the fence must not disappear because the host
+        # moved. Release evidence therefore includes a local strict run with the
+        # host present (22/22 assertions, exit 0).
+        env:
+          DSH_ANNOTATE_HOST_ROOT: absent
         run: |
           set -o pipefail
           node --test 2>&1 | tee test-output.txt
@@ -48,3 +60,13 @@ jobs:
             tail -n 80 test-output.txt | sed ':a;N;$!ba;s/\n/%0A/g' | sed 's/^/::error::Host-half tests failed:%0A/'
           fi
           exit "$status"
+
+      - name: Host shape fence must be visible
+        # The opt-out above is only acceptable if its trace is readable: this
+        # step fails unless the skip line is in the log of the run that produced
+        # it, so "green and quiet" cannot be confused with "verified".
+        run: |
+          if ! grep -F 'host shape check: skipped by DSH_ANNOTATE_HOST_ROOT=absent' test-output.txt; then
+            echo "::error::the host shape fence produced no skip line and no verification line"
+            exit 1
+          fi

@@ -47,8 +47,14 @@ window.__ModuleLoader__.load({
     var GAP = 8
     var TAB_ID = 'dsh-annotate'
 
-    /** Handles the sidebar services hand back once they activate. */
-    var runtime = { openTab: null }
+    /** Handles the services hand back once they activate. */
+    /**
+     * Handles the services hand back once they activate, plus the one knobs a
+     * test needs to run the shipping code without a browser: `frameScheduler`
+     * replaces the animation-frame clock for `jumpTick` (the default is
+     * `requestAnimationFrame`, then `setTimeout`).
+     */
+    var runtime = { openTab: null, sessions: null, frameScheduler: null }
 
     /* ------------------------------------------------------------ i18n */
 
@@ -86,6 +92,13 @@ window.__ModuleLoader__.load({
       'panel.unanchoredHint': '这句原文还没出现在当前加载的消息里。滚动到它所在的回复，高亮与编号徽标会自动出现。',
       'panel.error': '批注服务不可用：',
       'panel.loading': '加载中…',
+      'panel.jump.loading': '正在加载更早的原文…',
+      'panel.jump.failed.noSession': '宿主没有提供当前会话，无法定位原文',
+      'panel.jump.failed.absent': '本会话的历史已全部加载，仍未找到这句原文（可能已被编辑或压缩删除，或它在另一个视图/会话里）',
+      'panel.jump.failed.budget': '还有更早的历史没有加载；再点一次「跳回原文」会接着往前找',
+      'panel.jump.failed.stalled': '宿主没有返回更早的历史（已停止重试）',
+      'panel.jump.failed.folded': '原文在当前折叠的回复块里，尚未展开',
+      'panel.jump.failed.viewHint': '若原文在另一个视图（对话/轨迹）里，请先切回该视图再试',
       'toast.jumpFailed': '原文不在当前视图中',
       'toast.saveFailed': '保存失败',
       'toast.redeliverFailed': '重新投递失败',
@@ -125,6 +138,13 @@ window.__ModuleLoader__.load({
       'panel.unanchoredHint': 'The quoted message is not loaded yet. Scroll to the reply it came from and the highlight and badge appear on their own.',
       'panel.error': 'Annotation service unavailable: ',
       'panel.loading': 'Loading…',
+      'panel.jump.loading': 'Loading earlier messages…',
+      'panel.jump.failed.noSession': 'The host session is unavailable, so the source cannot be located.',
+      'panel.jump.failed.absent': 'All loaded history has been searched; the quoted text was not found (it may have been edited or compacted away, or it lives in another view or session).',
+      'panel.jump.failed.budget': 'Older history remains unloaded; press “Jump to source” again to keep searching backwards.',
+      'panel.jump.failed.stalled': 'The host returned no older history (retrying stopped).',
+      'panel.jump.failed.folded': 'The source sits inside a collapsed block that did not open.',
+      'panel.jump.failed.viewHint': 'If the source lives in the other view (Chat/Trajectory), switch back to it and try again.',
       'toast.jumpFailed': 'The source text is not in the current view',
       'toast.saveFailed': 'Could not save',
       'toast.redeliverFailed': 'Could not redeliver',
@@ -154,6 +174,10 @@ window.__ModuleLoader__.load({
       editor: null,
       toolbar: null,
       toast: null,
+      /** The one in-flight jump (`{id, gen, phase, reason, pages}`), or null. Never persisted. */
+      jump: null,
+      /** Bumped whenever a jump is started or abandoned, so an old loop dies on its next step. */
+      jumpGen: 0,
       scrollTick: 0,
       listeners: new Set(),
     }
@@ -305,6 +329,9 @@ window.__ModuleLoader__.load({
         store.focusId = null
         store.popover = null
         store.error = null
+        // A jump belongs to one session: switching away abandons it before the
+        // loop can page history in a session the user has left.
+        clearJump()
         emit()
       }
       refresh()
@@ -402,6 +429,219 @@ window.__ModuleLoader__.load({
 
     /* @pure-anchor
      *
+     * Jump-to-source core.
+     *
+     * The transcript does not unmount messages by viewport: chat renders every
+     * entry of the loaded event window, so a quote is missing from the DOM only
+     * when its message is outside that window — the host's own paging. The host
+     * exposes one public way to widen the window, `session.loadOlder()`, and one
+     * public progress signal, the event window's `revision`. The step function
+     * below is the whole decision table; the driver counts pages, stalls and
+     * frames. No wall clock is read: the budget is pages / stalls / frames, so a
+     * frozen `Date.now()` changes nothing here.
+     */
+
+    /** A single jump asks for at most this many pages before reporting `budget`. */
+    var JUMP_MAX_PAGES = 60
+    /** This many consecutive requests without a revision change is `stalled`. */
+    var JUMP_MAX_STALLS = 3
+    /** Frames to wait for an in-flight page (or a reveal) before counting a stall. */
+    var JUMP_TICKS_PER_PAGE = 60
+    /**
+     * Consecutive reveal attempts on matches that still draw nothing.
+     *
+     * A reveal costs one frame and, unlike a page, cannot be bounded by the
+     * stall counter: `locate()` hands back a fresh match each round when the
+     * DOM keeps producing new zero-box nodes, and `revealed` is re-earned for
+     * every new match by design. Without this cap that sequence never ends.
+     */
+    var JUMP_REVEAL_TRIES = 2
+    /**
+     * Total frames the wait phase may spend while the loaded window stays busy
+     * and silent.
+     *
+     * Two page-waits: one is the normal in-flight duration, two means nothing
+     * came back. Same unit as `JUMP_TICKS_PER_PAGE`, so the budget stays
+     * frames-based and a frozen wall clock changes nothing.
+     */
+    var JUMP_WAIT_BUDGET = 2 * JUMP_TICKS_PER_PAGE
+
+    var JUMP_ACTIONS = ['land', 'reveal', 'page', 'wait', 'fail']
+    var JUMP_REASONS = ['no-session', 'absent', 'stalled', 'budget', 'folded']
+
+    /** The i18n key that must be readable in the panel for one failure reason. */
+    var JUMP_REASON_KEYS = {
+      'no-session': 'panel.jump.failed.noSession',
+      absent: 'panel.jump.failed.absent',
+      stalled: 'panel.jump.failed.stalled',
+      budget: 'panel.jump.failed.budget',
+      folded: 'panel.jump.failed.folded',
+    }
+
+    /**
+     * The persistent label for one jump state, or null when there is no state
+     * to show. Every failure reason maps to a key of its own, which is what
+     * keeps the failed path from being a lone toast: the panel row renders this
+     * key for as long as the state lasts.
+     */
+    function jumpStateLabelKey(phase, reason) {
+      if (phase === 'failed') {
+        var key = JUMP_REASON_KEYS[reason]
+        return key === undefined ? 'toast.jumpFailed' : key
+      }
+      if (phase === 'locating' || phase === 'paging') return 'panel.jump.loading'
+      return null
+    }
+
+    /** Whether one phase is still working, i.e. the row's button must not re-enter. */
+    function jumpBusy(phase) {
+      return phase === 'locating' || phase === 'paging'
+    }
+
+    /**
+     * The opening call: is the session face usable at all?
+     *
+     * `binding === undefined` and a window that is not open are the two shapes
+     * of "no session". Anything else leaves the verdict to {@link jumpStep}.
+     */
+    function jumpSlot(input) {
+      if (input === null || input === undefined) return { action: 'fail', reason: 'no-session' }
+      if (input.binding !== true || input.open !== true) return { action: 'fail', reason: 'no-session' }
+      return jumpStep(input)
+    }
+
+    /**
+     * One step of the jump state machine.
+     *
+     * The order of the tests is part of the contract: a located quote is judged
+     * first (land, or reveal and then `folded`), then session health, then the
+     * in-flight guard — `loadOlder()` is a silent no-op while the host reports
+     * `loadingOlder`, so a step in that state must wait, never re-request — then
+     * history exhaustion and finally the budget. Inputs are re-read from the
+     * live host state before every step by the driver.
+     *
+     * @param input `{ hit, visible, revealed, binding, open, hasMore, loadingOlder, pages, stalls }`.
+     * @returns `{ action }` with `action ∈ JUMP_ACTIONS`, plus `reason` on `fail`.
+     */
+    function jumpStep(input) {
+      var state = input === null || input === undefined ? {} : input
+      if (state.hit === true) {
+        if (state.visible === true) return { action: 'land' }
+        if (state.revealed !== true) return { action: 'reveal' }
+        return { action: 'fail', reason: 'folded' }
+      }
+      if (state.binding !== true || state.open !== true) return { action: 'fail', reason: 'no-session' }
+      if (state.loadingOlder === true) return { action: 'wait' }
+      if (state.hasMore !== true) return { action: 'fail', reason: 'absent' }
+      if (state.stalls >= JUMP_MAX_STALLS) return { action: 'fail', reason: 'stalled' }
+      if (state.pages >= JUMP_MAX_PAGES) return { action: 'fail', reason: 'budget' }
+      return { action: 'page' }
+    }
+
+    /**
+     * Drive one jump to its terminal step.
+     *
+     * Everything that touches the page is injected, so the counting rules (one
+     * page per `page` step, a stall per request that does not move the window,
+     * a stall per reveal frame without a box) are exercised directly by the
+     * suite instead of only by hand in a browser.
+     *
+     * Counting rules, frozen: `page` increments `pages` before the request and
+     * then clears or increments `stalls` from the revision change; `wait` moves
+     * neither and only spends frames; `reveal` only flips `revealed` and spends
+     * one tick; `land` and `fail` end the run. A stale `gen` ends the run too.
+     *
+     * One net is added on top of the table. The table judges the in-flight guard
+     * (`loadingOlder`) before the stall counter — correctly, because that state
+     * must be waited for instead of re-requested — so a host that reports a page
+     * in flight forever would be waited on forever: no `page` step ever runs, so
+     * no stall is ever counted. Waiting therefore has its own frame budget
+     * (the same {@link JUMP_TICKS_PER_PAGE}); when it runs out with the window
+     * still silent and still busy, the host is not coming back and the run
+     * reports `stalled` instead of hanging.
+     *
+     * @param deps `{ gen, current(), locate(), visible(), revealed(), reveal(), tick(frames), state(), loadOlder(), revision(), lastRevision }`.
+     * @returns the terminal `{ action, reason, pages, stalls }`.
+     */
+    async function runJump(deps) {
+      var pages = 0
+      var stalls = 0
+      var waitedFrames = 0
+      var revealTries = 0
+      var revealed = deps.revealed()
+      var lastElement = null
+      for (;;) {
+        if (deps.gen !== deps.current()) return { action: 'abandoned', reason: null, pages: pages, stalls: stalls }
+        var hit = deps.locate()
+        if (hit !== lastElement) {
+          // A different match than last time: its own reveal has to be earned.
+          // `revealTries` deliberately does NOT reset here — a new match every
+          // step is exactly the case the budget exists for, so the tries must
+          // accumulate across the whole reveal streak. Only landing (below)
+          // starts a fresh streak.
+          lastElement = hit
+          revealed = false
+        }
+        var state = deps.state()
+        var output = jumpSlot({
+          hit: hit !== null,
+          visible: hit === null ? false : deps.visible() === true,
+          revealed: revealed,
+          binding: state.binding === true,
+          open: state.open === true,
+          hasMore: state.hasMore === true,
+          loadingOlder: state.loadingOlder === true,
+          pages: pages,
+          stalls: stalls,
+        })
+        if (output.action === 'land' || output.action === 'fail') {
+          return { action: output.action, reason: output.reason === undefined ? null : output.reason, pages: pages, stalls: stalls }
+        }
+        if (output.action === 'reveal') {
+          revealTries += 1
+          if (revealTries > JUMP_REVEAL_TRIES) {
+            // Revealed repeatedly and still nothing is drawn: this is the
+            // `folded` outcome, reached through the budget instead of a hang.
+            return { action: 'fail', reason: 'folded', pages: pages, stalls: stalls }
+          }
+          revealed = true
+          deps.reveal()
+          await deps.tick(1)
+          continue
+        }
+        if (output.action === 'wait') {
+          var beforeWait = deps.revision()
+          await deps.tick(JUMP_TICKS_PER_PAGE)
+          if (deps.gen !== deps.current()) return { action: 'abandoned', reason: null, pages: pages, stalls: stalls }
+          if (deps.revision() !== beforeWait) {
+            // The page landed after all: whatever silence was counted is over.
+            waitedFrames = 0
+            stalls = 0
+          } else {
+            waitedFrames += JUMP_TICKS_PER_PAGE
+            if (waitedFrames >= JUMP_WAIT_BUDGET) {
+              // Busy and silent for two whole wait budgets: the host is not
+              // coming back, and no page step will ever run to count a stall.
+              return { action: 'fail', reason: 'stalled', pages: pages, stalls: stalls }
+            }
+          }
+          deps.lastRevision = deps.revision()
+          continue
+        }
+        // 'page'
+        pages += 1
+        waitedFrames = 0
+        var before = deps.revision()
+        await deps.loadOlder()
+        await deps.tick(1)
+        if (deps.gen !== deps.current()) return { action: 'abandoned', reason: null, pages: pages, stalls: stalls }
+        deps.lastRevision = before
+        if (deps.revision() === before) stalls += 1
+        else stalls = 0
+      }
+    }
+
+    /*
      * Quote anchoring core, plus the geometry the badge overlay decides with.
      * Kept free of any DOM reference so it can be exercised directly by the
      * test suite: the browser side only builds the segment list, turns the
@@ -713,7 +953,73 @@ window.__ModuleLoader__.load({
       if (Number.isFinite(edges.top) && low < edges.top) return false
       return true
     }
+
     /* @pure-anchor-end */
+
+    /**
+     * Wait one frame: the injected clock when a test provides one, else the
+     * page's own animation frame, else a timer.
+     *
+     * It lives below the slice on purpose: `test/anchor.test.mjs` asserts the
+     * shipped slice never reaches for a DOM member, so the only frame-clock
+     * access stays out here.
+     */
+    function frameSchedule(callback) {
+      if (runtime.frameScheduler !== null && typeof runtime.frameScheduler === 'function') {
+        runtime.frameScheduler(callback)
+        return
+      }
+      if (typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(callback)
+        return
+      }
+      setTimeout(callback, 0)
+    }
+
+    /**
+     * Wait `frames` animation frames.
+     *
+     * Frames, not milliseconds: the budget must behave identically under a
+     * frozen wall clock.
+     */
+    function jumpTick(frames) {
+      var left = frames
+      return new Promise(function (resolve) {
+        var step = function () {
+          left -= 1
+          if (left <= 0) {
+            resolve()
+            return
+          }
+          frameSchedule(step)
+        }
+        frameSchedule(step)
+      })
+    }
+
+    /**
+     * The jump core and the dictionaries, published on the module object.
+     *
+     * The browser half is a ModuleLoader bundle, not a module, so a test can
+     * only reach it by evaluating the `@pure-anchor` slice. This object is built
+     * from those same declarations and handed back to whoever loads the module,
+     * so the two can be compared: the slice the suite runs cannot silently drift
+     * away from the one that ships. Nothing here touches the DOM.
+     */
+    var coreExports = {
+      JUMP_MAX_PAGES: JUMP_MAX_PAGES,
+      JUMP_MAX_STALLS: JUMP_MAX_STALLS,
+      JUMP_TICKS_PER_PAGE: JUMP_TICKS_PER_PAGE,
+      JUMP_REVEAL_TRIES: JUMP_REVEAL_TRIES,
+      JUMP_ACTIONS: JUMP_ACTIONS,
+      JUMP_REASONS: JUMP_REASONS,
+      JUMP_REASON_KEYS: JUMP_REASON_KEYS,
+      jumpStep: jumpStep,
+      jumpSlot: jumpSlot,
+      jumpStateLabelKey: jumpStateLabelKey,
+      jumpBusy: jumpBusy,
+      runJump: runJump,
+    }
 
     /** Ordered text segments of the transcript, skipping this plugin's own UI. */
     function collectSegments() {
@@ -937,27 +1243,368 @@ window.__ModuleLoader__.load({
       return rect
     }
 
-    function jumpTo(annotation) {
-      var rect = rangeRect(annotation.id)
-      var range = store.ranges[annotation.id]
-      if (rect === null || range === undefined) {
-        // Fall back to THIS annotation's own occurrence (the one captured at
-        // creation, or the creation-order table for older records), not the
-        // first one: with two annotations of the same sentence, always
-        // occurrence 0 would jump the second one to the first one's text.
-        var ordinal = wantedOccurrences(store.annotations)[annotation.id]
-        range = findQuoteRange(annotation.quote, ordinal === undefined ? 0 : ordinal)
-        if (range === null) {
-          showToast(tr('toast.jumpFailed'))
+    /** The nearest element at or above `node` (text nodes have no box of their own). */
+    function elementOf(node) {
+      if (node === null || node === undefined) return null
+      if (node.nodeType === Node.ELEMENT_NODE) return node
+      return node.parentElement === undefined ? null : node.parentElement
+    }
+
+    /** Read a box without letting a layout hiccup break the jump. */
+    function rectOf(element) {
+      if (element === null || element === undefined || typeof element.getBoundingClientRect !== 'function') return null
+      try {
+        return element.getBoundingClientRect()
+      } catch (error) {
+        return null
+      }
+    }
+
+    /**
+     * Whether a located quote has a box of its own.
+     *
+     * A quote inside `hidden="until-found"` content is still in the DOM — that
+     * is the platform's lazy *rendering*, not removal — so it can be matched by
+     * the text walker while measuring as a zero box. Zero means "located but not
+     * drawn", which is a state the jump has to resolve rather than scroll to.
+     */
+    function isDrawn(range) {
+      if (range === null || range === undefined || range.startContainer === undefined) return false
+      if (range.startContainer.isConnected !== true) return false
+      var rect = rectOf(elementOf(range.startContainer))
+      if (rect === null) return false
+      return rect.width !== 0 || rect.height !== 0
+    }
+
+    /**
+     * Reveal the collapsed block a located quote sits in.
+     *
+     * The host collapses turn-process members with the platform
+     * `hidden="until-found"` attribute and reveals them from the
+     * `beforematch` event (`dsh-client-ui-chat`: `useSearchableHidden`). That
+     * event is the documented trigger for this attribute, so dispatching it is
+     * the host's own reveal path rather than a guess about its DOM.
+     *
+     * @returns true when an element that carries the attribute was found.
+     */
+    function revealFold(range) {
+      var node = range === null || range === undefined ? null : elementOf(range.startContainer)
+      if (node === null || typeof node.closest !== 'function') return false
+      var folded = null
+      try {
+        folded = node.closest('[hidden="until-found"]')
+      } catch (error) {
+        folded = null
+      }
+      if (folded === null || folded === undefined) return false
+      try {
+        folded.dispatchEvent(new Event('beforematch', { bubbles: true }))
+      } catch (error) {
+        return false
+      }
+      return true
+    }
+
+    /**
+     * Scroll the located quote to the middle of the view.
+     *
+     * `scrollIntoView` scrolls every scrollable ancestor, so calling it for an
+     * element inside a scrollable block (a code block, a table) drags the
+     * transcript along. When the element itself is not scrollable, the nearest
+     * scrollable ancestor is scrolled by hand first, and the transcript is the
+     * fallback. Anything unreadable falls back to the plain call, which is the
+     * behaviour this had before.
+     */
+    function scrollIntoViewCentered(element) {
+      if (element === null || element === undefined || typeof element.scrollIntoView !== 'function') return
+      var target = element
+      var parent = element.parentElement
+      while (parent !== null && parent !== undefined) {
+        var style = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(parent) : null
+        var overflow = style === null ? '' : style.overflowY
+        if (overflow === 'auto' || overflow === 'scroll') {
+          if (parent.clientHeight < parent.scrollHeight) {
+            var box = rectOf(parent)
+            var own = rectOf(element)
+            if (box !== null && own !== null) {
+              parent.scrollTop += own.top - box.top - (box.height - own.height) / 2
+              target = element.closest('[data-conversation-scroll]') || null
+            }
+          }
+          break
+        }
+        parent = parent.parentElement
+      }
+      if (target === null) return
+      try {
+        target.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      } catch (error) {
+        try {
+          target.scrollIntoView()
+        } catch (ignored) {
+          /* scrolling is best-effort; the highlight is still applied */
+        }
+      }
+    }
+
+    /**
+     * The host's session binding for the session being jumped in, read fresh.
+     *
+     * Never cached: a binding is tied to one generation of a materialized
+     * session, so a retained reference would drive the *previous* session's
+     * `loadOlder`. Absent service, absent binding and a real throw all answer
+     * the same way, `{ok:false, why}`, because a jump must degrade, not throw.
+     */
+    function sessionLookup() {
+      if (store.sessionId === null) return { ok: false, binding: null, why: 'no session' }
+      var sessions = runtime.sessions
+      if (sessions === null || sessions === undefined || typeof sessions.binding !== 'function') {
+        return { ok: false, binding: null, why: 'the host provides no sessions service' }
+      }
+      try {
+        var binding = sessions.binding(store.sessionId)
+        if (binding === null || binding === undefined) return { ok: false, binding: null, why: 'the host has no binding for this session' }
+        return { ok: true, binding: binding, why: null }
+      } catch (error) {
+        return { ok: false, binding: null, why: error && error.message ? error.message : String(error) }
+      }
+    }
+
+    /** One page of the host's own progress signal, or null when unreadable. */
+    function windowRevision(binding) {
+      try {
+        var source = binding === null || binding === undefined ? null : binding.eventSource
+        if (source === null || source === undefined || typeof source.getSnapshot !== 'function') return null
+        var snapshot = source.getSnapshot()
+        if (snapshot === null || snapshot === undefined) return null
+        return typeof snapshot.revision === 'number' ? snapshot.revision : null
+      } catch (error) {
+        return null
+      }
+    }
+
+    /** The three public snapshot fields the step table judges, or nulls when unreadable. */
+    function sessionSnapshot(binding) {
+      var empty = { open: null, hasMore: null, loadingOlder: null }
+      try {
+        var session = binding === null || binding === undefined ? null : binding.session
+        if (session === null || session === undefined || typeof session.getSnapshot !== 'function') return empty
+        var snapshot = session.getSnapshot()
+        if (snapshot === null || snapshot === undefined) return empty
+        return { open: snapshot.openState, hasMore: snapshot.hasMore, loadingOlder: snapshot.loadingOlder }
+      } catch (error) {
+        return empty
+      }
+    }
+
+    /**
+     * Wait `frames` animation frames (a timer when the frame clock is missing).
+     *
+     * Frames, not milliseconds: the budget must behave identically under a
+     * frozen wall clock.
+     */
+    /** The state one jump step judges, read from the live host face. */
+    function jumpStateOf(binding) {
+      if (binding === null) return { binding: false, open: false, hasMore: false, loadingOlder: false }
+      var snapshot = sessionSnapshot(binding)
+      return {
+        binding: true,
+        open: snapshot.open === 'open',
+        hasMore: snapshot.hasMore === true,
+        loadingOlder: snapshot.loadingOlder === true,
+      }
+    }
+
+    /** This annotation's jump state, or null — a jump is shown on its own row only. */
+    function jumpOf(id) {
+      return store.jump !== null && store.jump.id === id ? store.jump : null
+    }
+
+    /** The occurrence one annotation is located at, from the record or the fallback table. */
+    function wantedOrdinal(id) {
+      var wanted = wantedOccurrences(store.annotations)[id]
+      return wanted === undefined ? 0 : wanted
+    }
+
+    /**
+     * The quote's Range right now: the retained one, else a fresh search.
+     *
+     * Shared by the host-independent first step and by the paging driver, so
+     * both judge the same thing: the retained range while its node is still
+     * connected (which also keeps the match's identity stable across steps),
+     * otherwise one `findQuoteRange` pass at this annotation's own occurrence.
+     */
+    function locateJumpRange(wanted) {
+      var range = store.ranges[wanted.id]
+      if (range !== undefined && range.startContainer !== undefined && range.startContainer.isConnected === true) return range
+      var found = findQuoteRange(wanted.quote, wanted.ordinal)
+      if (found !== null) store.ranges[wanted.id] = found
+      return found
+    }
+
+    /**
+     * Land on a located quote and end the jump.
+     *
+     * Path 1's user-visible result, unchanged from 0.9.0: scroll the quote to
+     * the middle of its scrollport, repaint the highlights, clear the jump
+     * state. A node that is in the DOM with a non-zero box needs no host, so
+     * this is reachable with no session service at all.
+     */
+    function landJump(id, gen) {
+      store.jump = null
+      syncHighlights()
+      var range = store.ranges[id]
+      scrollIntoViewCentered(range === undefined ? null : elementOf(range.startContainer))
+      emit()
+    }
+
+    /** Every runJump collaborator a real jump needs; also what a missing service short-circuits. */
+    function jumpDeps(gen, wanted) {
+      var holder = { lastRevision: null }
+      var located = null
+      return {
+        gen: gen,
+        current: function () { return store.jumpGen },
+        locate: function () {
+          located = locateJumpRange(wanted)
+          return located
+        },
+        visible: function () { return isDrawn(located) },
+        revealed: function () { return false },
+        reveal: function () { revealFold(located) },
+        tick: function (frames) { return jumpTick(frames) },
+        state: function () {
+          var lookup = sessionLookup()
+          if (!lookup.ok) return { binding: false, open: false, hasMore: false, loadingOlder: false }
+          return jumpStateOf(lookup.binding)
+        },
+        /**
+         * One page of the host's own history, through the host's own verb.
+         *
+         * The binding is resolved at the moment of the call and never cached: a
+         * binding belongs to one generation of a materialized session, and a
+         * retained one would page a session that is gone (§4.2 rule 1). If the
+         * face disappears mid-jump, this returns without paging and the next
+         * step reports `no-session` (or keeps waiting while the host is busy),
+         * so a vanished host degrades instead of throwing.
+         */
+        loadOlder: function () {
+          var lookup = sessionLookup()
+          if (!lookup.ok) return
+          var session = lookup.binding.session
+          if (session === null || session === undefined || typeof session.loadOlder !== 'function') return
+          return session.loadOlder()
+        },
+        revision: function () {
+          var lookup = sessionLookup()
+          if (!lookup.ok) return holder.lastRevision
+          var revision = windowRevision(lookup.binding)
+          return revision === null ? holder.lastRevision : revision
+        },
+        get lastRevision() { return holder.lastRevision },
+        set lastRevision(value) { holder.lastRevision = value },
+      }
+    }
+
+    /**
+     * Run one jump: locate, page the host's history in, scroll, or fail loudly.
+     *
+     * The failed states are terminal until the next click: the row keeps the
+     * reason, the button stays usable, and the diagnostic attributes stay on
+     * the element, so a dead-looking click always leaves something to read and
+     * something to press again.
+     */
+    async function executeJump(wanted, gen) {
+      // The frozen table's first line, run before anything host-shaped is
+      // touched: a quote that is already loaded and drawn is scrolled to with
+      // no session service at all. 0.9.0 had no such dependency, and a missing
+      // `sessions` service must not cost a capability that never needed it.
+      var first = jumpStep({
+        hit: false,
+        visible: false,
+        revealed: false,
+        binding: true,
+        open: true,
+        hasMore: true,
+        loadingOlder: false,
+        pages: 0,
+        stalls: 0,
+      })
+      if (first.action === 'page') {
+        var located = locateJumpRange(wanted)
+        if (located !== null && isDrawn(located)) {
+          landJump(wanted.id, gen)
           return
         }
-        store.ranges[annotation.id] = range
-        rect = range.getBoundingClientRect()
       }
-      var element = range.startContainer.parentElement
-      if (element !== null) element.scrollIntoView({ block: 'center', behavior: 'smooth' })
-      syncHighlights()
+      var lookup = sessionLookup()
+      if (!lookup.ok) {
+        finishJump(wanted.id, gen, { action: 'fail', reason: 'no-session', pages: 0 }, lookup.why)
+        return
+      }
+      var outcome = await runJump(jumpDeps(gen, wanted))
+      if (outcome.action === 'abandoned') return
+      finishJump(wanted.id, gen, outcome, null)
+    }
+
+    /**
+     * The one place a jump ends.
+     *
+     * Success clears the state and moves the view; a failure keeps the reason
+     * (and the page budget it burned) on the annotation's row, keeps the button
+     * usable for a retry, and echoes the same sentence once as a toast — the
+     * toast is allowed, being the only signal is not.
+     */
+    function finishJump(id, gen, outcome, why) {
+      if (gen !== store.jumpGen) return
+      if (outcome.action === 'land') {
+        landJump(id, gen)
+        return
+      }
+      var reason = outcome.reason === null || outcome.reason === undefined ? 'absent' : outcome.reason
+      if (why !== null && why !== undefined) console.warn('[dsh-annotate] jump to source:', reason, why)
+      store.jump = { id: id, gen: gen, phase: 'failed', reason: reason, pages: outcome.pages === undefined ? 0 : outcome.pages }
+      showToast(tr(jumpStateLabelKey('failed', reason)))
+    }
+
+    /**
+     * Jump to one annotation's quote.
+     *
+     * Path 1 (already in the loaded window) scrolls straight there, exactly as
+     * 0.9.0 did. Path 2 (the message is above the window) widens the window with
+     * the host's own public `loadOlder()` before locating again. Path 3 has no
+     * route at all and leaves the persistent, retryable failure state built by
+     * {@link finishJump} instead of a toast and nothing else.
+     */
+    function jumpTo(annotation) {
+      var gen = store.jumpGen + 1
+      store.jumpGen = gen
+      store.jump = { id: annotation.id, gen: gen, phase: 'locating', reason: null, pages: 0 }
+      var wanted = {
+        id: annotation.id,
+        quote: annotation.quote,
+        ordinal: wantedOrdinal(annotation.id),
+      }
       emit()
+      executeJump(wanted, gen).catch(function (error) {
+        fail('jump to source', error)
+        finishJump(wanted.id, gen, { action: 'fail', reason: 'stalled', pages: 0 }, null)
+      })
+    }
+
+    /**
+     * Abandon the running jump, if any.
+     *
+     * Bumping the generation is what stops the loop: its next step sees a stale
+     * `gen` and returns without touching the store, so a session switch or a
+     * closed panel cannot leave a jump running against the wrong session.
+     */
+    function clearJump() {
+      store.jumpGen += 1
+      if (store.jump !== null) {
+        store.jump = null
+        emit()
+      }
     }
 
     function showToast(message) {
@@ -1582,12 +2229,14 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function smallButton(label, onClick, tone) {
+    function smallButton(label, onClick, tone, disabled) {
+      var off = disabled === true
       return h(
         'button',
         {
           type: 'button',
           onClick: onClick,
+          disabled: off,
           style: {
             padding: '3px 9px',
             border: '1px solid var(--dsw-alias-border-l1)',
@@ -1595,12 +2244,48 @@ window.__ModuleLoader__.load({
             background: 'transparent',
             color: tone === 'danger' ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-label-secondary)',
             font: '11px/1.5 system-ui, sans-serif',
-            cursor: 'pointer',
+            cursor: off ? 'default' : 'pointer',
+            opacity: off ? 0.55 : 1,
             whiteSpace: 'nowrap',
           },
         },
         label,
       )
+    }
+
+    /**
+     * The persistent line one jump state puts on its own annotation.
+     *
+     * While the jump works, this is the busy label, so no toast has to stand in
+     * for progress. When it failed, this is the reason sentence plus, for the
+     * reasons where it is true, the hint that the quote may live in the other
+     * view. The element carries `data-dsa-jump="<phase>:<reason>"` and the page
+     * budget it burned, which is what makes a failure readable in DevTools
+     * instead of being a sentence that vanished after 1.4 seconds.
+     */
+    function JumpStatus(props) {
+      var jump = props.jump
+      if (jump === null || jump === undefined) return null
+      var label = jumpStateLabelKey(jump.phase, jump.reason)
+      if (label === null) return null
+      var failed = jump.phase === 'failed'
+      var attributes = {
+        style: {
+          color: failed ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-label-secondary)',
+          font: '11px/1.6 system-ui, sans-serif',
+        },
+      }
+      if (failed) {
+        attributes['data-dsa-jump'] = 'failed:' + jump.reason
+        attributes['data-dsa-jump-pages'] = String(jump.pages)
+      } else {
+        attributes['data-dsa-jump'] = jump.phase
+      }
+      var children = [tr(label)]
+      if (failed && (jump.reason === 'absent' || jump.reason === 'no-session')) {
+        children.push(h('div', { style: { color: 'var(--dsw-alias-label-secondary)' } }, tr('panel.jump.failed.viewHint')))
+      }
+      return h('div', attributes, children)
     }
 
     /**
@@ -1622,6 +2307,7 @@ window.__ModuleLoader__.load({
       var annotation = props.annotation
       var number = props.number
       var focused = props.focused === true
+      var jump = jumpOf(annotation.id)
       var rowRef = React.useRef(null)
       React.useEffect(
         function () {
@@ -1631,6 +2317,18 @@ window.__ModuleLoader__.load({
           }
         },
         [focused],
+      )
+      // Unmounting the surface that shows a running jump abandons it: the loop
+      // stops at its next step instead of paging history the user cannot see.
+      // Only this annotation's jump is touched, so a list refresh that unmounts
+      // some other row never cancels the jump the user is watching.
+      React.useEffect(
+        function () {
+          return function () {
+            if (jumpOf(annotation.id) !== null) clearJump()
+          }
+        },
+        [annotation.id],
       )
       var editingPair = React.useState(false)
       var editing = editingPair[0]
@@ -1708,7 +2406,7 @@ window.__ModuleLoader__.load({
                   },
                   title: tr('panel.unanchoredHint'),
                 }, tr('panel.unanchored')),
-            smallButton(tr('panel.jump'), guard('jump to source', function () { jumpTo(annotation) })),
+            smallButton(tr('panel.jump'), guard('jump to source', function () { jumpTo(annotation) }), undefined, jumpBusy(jump === null ? null : jump.phase)),
             annotation.status === 'delivered'
               ? smallButton(
                   tr('panel.redeliver'),
@@ -1723,6 +2421,7 @@ window.__ModuleLoader__.load({
               mutate({ action: 'delete', id: annotation.id, sessionId: store.sessionId }).catch(function () {})
             }, 'danger'),
           ),
+          h(JumpStatus, { jump: jump }),
           h(
             'div',
             {
@@ -1805,6 +2504,16 @@ window.__ModuleLoader__.load({
       }
       if (annotation === null) return null
       var numbers = allNumbers()
+      // Same rule as the panel row: closing the surface that shows a running
+      // jump abandons that jump, and only that one.
+      React.useEffect(
+        function () {
+          return function () {
+            if (jumpOf(annotation.id) !== null) clearJump()
+          }
+        },
+        [annotation.id],
+      )
       return h(
         'div',
         {
@@ -1868,10 +2577,16 @@ window.__ModuleLoader__.load({
           },
           annotation.note.length > 0 ? annotation.note : tr('panel.noNote'),
         ),
+        h(JumpStatus, { jump: jumpOf(annotation.id) }),
         h(
           'div',
           { style: { display: 'flex', gap: '6px' } },
-          smallButton(tr('panel.jump'), guard('jump to source', function () { jumpTo(annotation) })),
+          smallButton(
+            tr('panel.jump'),
+            guard('jump to source', function () { jumpTo(annotation) }),
+            undefined,
+            jumpBusy(store.jump !== null && store.jump.id === annotation.id ? store.jump.phase : null),
+          ),
           smallButton(tr('panel.openSidebar'), guard('open sidebar', function () { openSidebar(annotation.id) })),
           annotation.status === 'delivered'
             ? smallButton(
@@ -2095,6 +2810,7 @@ window.__ModuleLoader__.load({
             clearTimeout(anchorRetryTimer)
             anchorRetryTimer = null
           }
+          clearJump()
           try {
             if (window.CSS && CSS.highlights) CSS.highlights.delete(HIGHLIGHT_NAME)
           } catch (error) {
@@ -2115,6 +2831,16 @@ window.__ModuleLoader__.load({
           { name: 'conversation.input.right', id: 'dsh-annotate.chip', order: 50 },
           Chip,
         )
+      })
+
+      // The jump needs the host's own session face to widen the loaded history
+      // window (`loadOlder`) and to read its progress (`revision`). `sessions`
+      // is a public client service (the client API catalogue lists it) and the
+      // host's own chat and trajectory views reach it exactly this way; the
+      // injection is declared here rather than in `package.json`, so a host that
+      // does not offer it simply leaves the jump on its honest failure path.
+      ctx.inject(['sessions'], function (scoped) {
+        if (scoped.sessions !== undefined && scoped.sessions !== null) runtime.sessions = scoped.sessions
       })
 
       // The panel body is a right-sidebar tab: one tab type (stage one) plus
@@ -2176,6 +2902,6 @@ window.__ModuleLoader__.load({
       })
     }
 
-    return { inject: ['slots', 'locale'], apply: apply }
+    return { inject: ['slots', 'locale'], apply: apply, core: coreExports }
   },
 })
