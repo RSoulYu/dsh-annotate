@@ -87,8 +87,11 @@ export const inject = ['tools']
  * running process only picks up this file at boot or after the plugin row is
  * re-activated; the tool reports this value so "which revision is live" is
  * answerable without a restart-and-guess.
+ *
+ * Revision 10: loading the store now backfills the numbers the records written
+ * before 0.8.0 never persisted, and leaves a copy of the store behind first.
  */
-const REVISION = 9
+const REVISION = 10
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
 /**
@@ -99,6 +102,17 @@ const ROUTE_PATH = '/plugins/dsh-annotate/api'
  */
 const BLOCK_SOURCE_KIND = 'dsh-annotate'
 const STORE_VERSION = 1
+/**
+ * Where the one-shot pre-migration copy of the store goes: beside it, under a
+ * fixed name.
+ *
+ * The suffix carries the version that introduced the backfill so the file says
+ * what it is, and stays free of a timestamp on purpose — a timestamp would pile
+ * up one file per retry, and the earliest copy is the useful one. The copy is
+ * written with `flag: 'wx'` (mode `0600`), so only the first migration creates
+ * it and nobody can lose an earlier copy to a later run.
+ */
+const MIGRATION_BACKUP_SUFFIX = '.migrate-0.9.0.bak'
 const MAX_BODY_BYTES = 512 * 1024
 const MAX_QUOTE = 2000
 const MAX_NOTE = 4000
@@ -227,12 +241,23 @@ async function writeAtomic(file, text) {
 /* --------------------------------------------------------------- the store */
 
 class AnnotationStore {
-  /** @param {string} file absolute path of the JSON document. */
-  constructor(file) {
+  /**
+   * @param {string} file absolute path of the JSON document.
+   * @param {any} [logger] `ctx.logger`; the backfill reports through it. Absent
+   *   or partial loggers are tolerated — a missing method is never an error.
+   */
+  constructor(file, logger) {
     this.file = file
+    this.logger = logger
     this.state = blankState()
     this.loaded = false
     this.loading = undefined
+    /**
+     * The bytes `load()` read this boot, kept for the pre-migration backup so it
+     * can be a copy of the file as it was rather than of a re-serialised state.
+     * `undefined` when there was nothing to read (missing or unparsable file).
+     */
+    this.source = undefined
     /** Serializes writes so two concurrent API calls cannot interleave. */
     this.writing = Promise.resolve()
   }
@@ -241,10 +266,12 @@ class AnnotationStore {
     if (this.loaded) return this.state
     if (this.loading !== undefined) return this.loading
     this.loading = (async () => {
+      this.source = undefined
       try {
         const text = await readFile(this.file, 'utf8')
         const parsed = JSON.parse(text)
         const raw = Array.isArray(parsed?.annotations) ? parsed.annotations : []
+        this.source = text
         this.state = { version: STORE_VERSION, annotations: raw.map(normalizeRecord).filter((r) => r !== undefined) }
       } catch (error) {
         if (error?.code !== 'ENOENT') {
@@ -257,10 +284,106 @@ class AnnotationStore {
         }
         this.state = blankState()
       }
+      // Deliberately OUTSIDE the try/catch above: an unexpected throw in here
+      // must never be mistaken for a corrupt document, which would move the real
+      // store aside and start from an empty state. A failure here is logged and
+      // the boot carries on with the numbers read at run time (see
+      // `backfillNumbers`), and the next boot retries.
+      try {
+        await this.backfillNumbers()
+      } catch (error) {
+        this.logger?.warn?.('dsh-annotate: annotation number backfill failed: %o', error)
+      }
       this.loaded = true
       return this.state
     })()
     return this.loading
+  }
+
+  /**
+   * One-shot backfill of the numbers the pre-0.8.0 records never persisted.
+   *
+   * Returns the number of records written; 0 means "nothing to do" and no write
+   * happened. Never throws: every failure is logged and leaves the store as it
+   * was, so the next boot retries with the read-time derivation still in place.
+   *
+   * The value written is the one {@link numbering} ALREADY reports for that
+   * record — the same function every projection reads — so the upgrade changes
+   * no number the user can see. Records that do carry a valid number (including
+   * the duplicated ones a hand-edited file can hold) are never rewritten.
+   *
+   * Order matters: the backup lands first, then the in-memory numbers, then the
+   * store. Until the backup exists nothing has been changed anywhere, and if the
+   * store write fails the in-memory numbers are rolled back so memory and disk
+   * agree again and a later flush cannot persist them by accident.
+   *
+   * The store is written through {@link writeAtomic} rather than `this.flush()`
+   * on purpose: `flush()` chains onto `this.writing` and a rejection there would
+   * silently fail every later flush of the boot. Nothing can be racing this
+   * write — every path that flushes awaits `load()` first — so the serialization
+   * the chain buys is not needed this early.
+   */
+  async backfillNumbers() {
+    const groups = new Map()
+    for (const record of this.state.annotations) {
+      const group = groups.get(record.sessionId)
+      if (group === undefined) groups.set(record.sessionId, [record])
+      else group.push(record)
+    }
+    const filled = []
+    for (const group of groups.values()) {
+      // The session's own records, in the order they are stored: `numbering()`
+      // sorts by `createdAt` itself and keeps the document order on a tie, which
+      // is the rule every read path already resolves a tie with.
+      const numbers = numbering(group)
+      for (const record of group) {
+        // Missing and invalid go the same way: `normalizeRecord` already turned
+        // a string, a fraction, a zero, a negative and `NaN` into `undefined`.
+        if (asNumber(record.number) !== undefined) continue
+        const derived = numbers.get(record.id)
+        if (!Number.isInteger(derived) || derived < 1) continue
+        filled.push([record, derived])
+      }
+    }
+    if (filled.length === 0) return 0
+
+    const backup = `${this.file}${MIGRATION_BACKUP_SUFFIX}`
+    try {
+      // `wx` = O_CREAT|O_EXCL: an existing backup means a previous migration got
+      // here first, and that earlier copy is the more valuable one. Keep it and
+      // carry on — refusing to migrate would leave a machine that lost the
+      // backup file unnumbered forever.
+      await writeFile(backup, this.source, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    } catch (error) {
+      if (error?.code !== 'EEXIST') {
+        this.logger?.warn?.(
+          'dsh-annotate: could not write the pre-0.9.0 store backup; the store is left untouched: %o',
+          error,
+        )
+        return 0
+      }
+      this.logger?.info?.('dsh-annotate: pre-0.9.0 store backup already present; keeping the earliest copy')
+    }
+
+    for (const [record, value] of filled) record.number = value
+    const snapshot = JSON.stringify({ version: STORE_VERSION, annotations: this.state.annotations }, null, 2)
+    try {
+      await mkdir(dirname(this.file), { recursive: true })
+      await writeAtomic(this.file, snapshot)
+    } catch (error) {
+      for (const [record] of filled) record.number = undefined
+      this.logger?.warn?.(
+        'dsh-annotate: could not persist the backfilled annotation numbers; they stay derived this boot: %o',
+        error,
+      )
+      return 0
+    }
+    this.logger?.info?.(
+      'dsh-annotate: backfilled %d annotation number(s); the pre-migration store is at %s',
+      filled.length,
+      backup,
+    )
+    return filled.length
   }
 
   async flush() {
@@ -650,8 +773,8 @@ function toClient(record, numbers) {
  * @param {import('@deepseek-ai/cordis').Context} ctx plugin context.
  */
 export function apply(ctx) {
-  const store = new AnnotationStore(storePath())
   const logger = ctx.logger ?? console
+  const store = new AnnotationStore(storePath(), logger)
   /** Per-boot secret: only a page this process served can present it. */
   const token = randomUUID()
   let tokenPublished = false

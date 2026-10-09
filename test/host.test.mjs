@@ -10,28 +10,62 @@
  * Run with: node --test
  */
 
-import { mkdtemp, rm, writeFile, mkdir, readFile, readdir } from 'node:fs/promises'
+import { chmod, mkdtemp, rm, writeFile, mkdir, readFile, readdir, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-/** Build the fake plugin context, capturing what the plugin registers. */
-function fakeContext() {
-  const captured = { events: new Map(), tools: [], effects: 0, routes: [], warns: [] }
+/** The store the plugin reads and writes under `$DSH_HOME`. */
+const STORE = join('annotations', 'annotations.json')
+/**
+ * The one-shot pre-migration copy 0.9.0 leaves next to the store. The name is
+ * frozen by the A spec (a timestamped name would pile up one file per retry).
+ */
+const BACKUP_SUFFIX = '.migrate-0.9.0.bak'
+
+/**
+ * Build the fake plugin context, capturing what the plugin registers.
+ *
+ * `options.infoThrows` makes the injected logger throw from `info()`. The logger
+ * is a collaborator the store is HANDED, so this is the only way a test can make
+ * an "unexpected throw" escape `backfillNumbers()`: the migration's own errors
+ * are all caught inside it, and `node:fs/promises`' named exports cannot be
+ * re-bound from here (a filesystem error therefore cannot be made to escape).
+ */
+function fakeContext(options = {}) {
+  const captured = { events: new Map(), tools: [], effects: 0, routes: [], warns: [], infos: [] }
   const webServer = {
     register(route) {
       captured.routes.push(route)
       return () => {}
     },
   }
+  // `console`-style logger: the plugin calls `warn(fmt, error)` / `info(fmt, …)`
+  // with `%s`/`%d`/`%o` placeholders, exactly like `console.warn` does. The
+  // placeholders are substituted here so an assertion can match what the line
+  // actually says — and the trailing arguments are appended so a failure reason
+  // (an error code, say) is not dropped.
+  const joined = (format, ...args) => {
+    let index = 0
+    const substituted = String(format).replace(/%[sdo]/g, () => {
+      const value = args[index]
+      index += 1
+      return value === undefined ? '(undefined)' : String(value)
+    })
+    return [substituted, ...args.slice(index)].map((value) => String(value)).join(' ')
+  }
   const ctx = {
     logger: {
-      warn(message) {
-        captured.warns.push(message)
+      warn(...args) {
+        captured.warns.push(joined(...args))
       },
-      info() {},
+      info(...args) {
+        if (options.infoThrows === true) throw new Error('the injected logger failed')
+        captured.infos.push(joined(...args))
+      },
     },
     on(name, handler) {
       captured.events.set(name, handler)
@@ -63,29 +97,61 @@ function fakeContext() {
 }
 
 /** Seed a store file and load a fresh copy of the plugin against it. */
-async function withPlugin(annotations, run) {
+async function withPlugin(annotations, run, options = {}) {
   const home = await mkdtemp(join(tmpdir(), 'dsa-test-'))
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   try {
     await mkdir(join(home, 'annotations'), { recursive: true })
-    await writeFile(
-      join(home, 'annotations', 'annotations.json'),
-      JSON.stringify({ version: 1, annotations }, null, 2),
-      'utf8',
-    )
-    const url = new URL('../index.js', import.meta.url)
-    url.searchParams.set('t', String(Date.now()) + Math.random())
-    const plugin = await import(url.href)
-    const { ctx, captured } = fakeContext()
-    plugin.apply(ctx)
-    await run({ home, captured, plugin })
+    await writeFile(join(home, STORE), JSON.stringify({ version: 1, annotations }, null, 2), 'utf8')
+    const { ctx, captured } = await bootPlugin(options)
+    await run({ home, captured, ctx })
   } finally {
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome
     await rm(home, { recursive: true, force: true })
   }
 }
+
+/**
+ * Boot another copy of the host half over whatever `$DSH_HOME` points at, the
+ * way a restart does: a fresh module instance plus a fresh context, so the new
+ * boot's `load()` runs for the first time. The caller owns the temp home.
+ */
+async function bootPlugin(options = {}) {
+  const url = new URL('../index.js', import.meta.url)
+  url.searchParams.set('t', `boot-${Date.now()}-${Math.random()}`)
+  const plugin = await import(url.href)
+  const { ctx, captured } = fakeContext(options)
+  plugin.apply(ctx)
+  return { plugin, ctx, captured }
+}
+
+function storeOf(home) {
+  return join(home, STORE)
+}
+
+function backupOf(home) {
+  return storeOf(home) + BACKUP_SUFFIX
+}
+
+async function sha256Of(file) {
+  return createHash('sha256').update(await readFile(file)).digest('hex')
+}
+
+/** The `createdAt` → id order of the document, i.e. creation order. */
+function idOrderOf(annotations) {
+  return annotations
+    .slice()
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map((item) => item.id)
+}
+
+/** id → number of one API payload, in no particular order. */
+function numbersOf(payload) {
+  return new Map(payload.annotations.map((item) => [item.id, item.number]))
+}
+
 
 function userStep(text) {
   return {
@@ -157,8 +223,13 @@ async function emitSession(captured, sessionId, type, data) {
 
 /** Read the persisted store back as a map by id. */
 async function storedById(home) {
-  const stored = JSON.parse(await readFile(join(home, 'annotations', 'annotations.json'), 'utf8'))
+  const stored = JSON.parse(await readFile(storeOf(home), 'utf8'))
   return new Map(stored.annotations.map((item) => [item.id, item]))
+}
+
+/** The whole persisted document, for the count and the `version` field. */
+async function readDoc(home) {
+  return JSON.parse(await readFile(storeOf(home), 'utf8'))
 }
 
 /**
@@ -1182,13 +1253,14 @@ test('clearing the delivered annotations does not move the pending numbers', asy
   )
 })
 
-test('records written before the field existed keep the pre-0.8.0 1..N output', async () => {
+test('records written before the field existed are backfilled with the pre-0.8.0 1..N output', async () => {
   const createdAt = Date.now() - 5000
   const seeded = [
     record({ id: 'a1', quote: '第一处', createdAt }),
     record({ id: 'a2', quote: '第二处', createdAt: createdAt + 1 }),
     record({ id: 'a3', quote: '第三处', createdAt: createdAt + 2 }),
   ]
+  const seededText = JSON.stringify({ version: 1, annotations: seeded }, null, 2)
   await withPlugin(seeded, async ({ home, captured }) => {
     const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
     assert.deepEqual(
@@ -1208,14 +1280,18 @@ test('records written before the field existed keep the pre-0.8.0 1..N output', 
     )
     assert.match(blockTextOf(decision), /—— 批注（共 3 处，编号 1、2、3）——/)
 
-    // A flush does not invent an identity for a legacy record: the derived
-    // numbers stay a read-time fallback, which is what keeps their known cost
-    // (they still move when an earlier legacy record is deleted) visible.
+    // 0.9.0 pins those three numbers down instead of leaving them to the
+    // read-time fallback: the values written are exactly the ones the block,
+    // the API and the tool reported above — the backfill changes no reading. The
+    // pre-migration document is kept beside the store, byte for byte.
     await emitSession(captured, 'session-alpha', 'user/message', blockMessageOf(decision))
     const stored = await storedById(home)
-    for (const id of ['a1', 'a2', 'a3']) {
-      assert.equal('number' in stored.get(id), false, `${id} must not gain a number on disk`)
-    }
+    assert.deepEqual(
+      ['a1', 'a2', 'a3'].map((id) => stored.get(id).number),
+      [1, 2, 3],
+      'each legacy record persisted the number it already read',
+    )
+    assert.equal(await readFile(backupOf(home), 'utf8'), seededText, 'the backup is the document as it was seeded')
   })
 })
 
@@ -1306,6 +1382,487 @@ test('a number survives a reload and the next annotation continues from it', asy
     })
     assert.equal(third.payload.annotation.number, 3, 'and the session continues, it does not start over')
   })
+})
+
+/* ------------------- the 0.9.0 number backfill (records before 0.8.0) ----- */
+
+test('the backfill writes the numbers the session already reads, and nothing else', async () => {
+  const createdAt = Date.now() - 4000
+  const seeded = [
+    record({
+      id: 'old-a',
+      quote: '旧一',
+      note: '旧批注',
+      createdAt,
+      status: 'delivered',
+      deliveredAt: createdAt + 3,
+      deliveredTurn: 7,
+    }),
+    record({ id: 'kept', quote: '有号', createdAt: createdAt + 1, number: 5 }),
+    record({ id: 'old-b', quote: '旧二', createdAt: createdAt + 2 }),
+  ]
+  // `record()` mirrors the shape the store can actually hold; an occurrence is
+  // the one field it leaves out, so it is added here where a record that HAS one
+  // is what the backfill must leave alone.
+  const withOccurrence = seeded.map((item) => (item.id === 'old-a' ? { ...item, occurrence: 2 } : item))
+  await withPlugin(withOccurrence, async ({ home, captured }) => {
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    const read = numbersOf(listed.payload)
+
+    // The stored values and the order the session reads them in: kept=5,
+    // old-a=1, old-b=2. The mapping, not the display order, is what is asserted.
+    assert.equal(read.get('kept'), 5, 'a persisted number keeps its value')
+    assert.equal(read.get('old-a'), 1)
+    assert.equal(read.get('old-b'), 2)
+
+    const stored = await storedById(home)
+    assert.deepEqual(
+      [...read.keys()].sort().map((id) => [id, stored.get(id).number]),
+      [
+        ['kept', 5],
+        ['old-a', 1],
+        ['old-b', 2],
+      ],
+      'every legacy record persisted exactly the number it already read',
+    )
+    assert.equal(stored.get('kept').number, 5, 'a record with a stored number is never rewritten')
+    assert.equal(stored.get('old-a').note, '旧批注', 'the note is untouched')
+    assert.equal(stored.get('old-a').status, 'delivered', 'the status is untouched')
+    assert.equal(stored.get('old-a').deliveredAt, createdAt + 3, 'the delivery stamp is untouched')
+    assert.equal(stored.get('old-a').deliveredTurn, 7, 'the delivered turn is untouched')
+    assert.equal(stored.get('old-a').occurrence, 2, 'the occurrence is untouched')
+    assert.equal(stored.get('old-b').quote, '旧二', 'the quote is untouched')
+    for (const id of ['old-a', 'kept', 'old-b']) {
+      assert.deepEqual(
+        [stored.get(id).createdAt, stored.get(id).updatedAt],
+        [withOccurrence.find((item) => item.id === id).createdAt, withOccurrence.find((item) => item.id === id).updatedAt],
+        `${id}: createdAt/updatedAt are untouched`,
+      )
+    }
+    const doc = await readDoc(home)
+    assert.equal(doc.annotations.length, withOccurrence.length, 'no record was added or removed')
+    assert.equal(doc.version, 1, 'the document keeps its version')
+  })
+})
+
+test('the backfill leaves a duplicated stored value alone and keeps one definite reading', async () => {
+  const createdAt = Date.now() - 4000
+  const seeded = [
+    record({ id: 'dup-first', quote: 'A', createdAt, number: 7 }),
+    record({ id: 'dup-second', quote: 'B', createdAt: createdAt + 1, number: 7 }),
+    record({ id: 'other', quote: 'C', createdAt: createdAt + 2, number: 3 }),
+    record({ id: 'late', quote: 'D', createdAt: createdAt + 3 }),
+  ]
+  const seededText = JSON.stringify({ version: 1, annotations: seeded }, null, 2)
+  await withPlugin(seeded, async ({ home, captured }) => {
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    const read = numbersOf(listed.payload)
+
+    assert.equal(read.get('dup-first'), 7, 'the earliest holder of the value keeps it')
+    assert.notEqual(read.get('dup-second'), 7, 'the loser is not given the same number')
+    assert.equal(new Set(read.values()).size, 4, 'four records, four different numbers')
+
+    const stored = await storedById(home)
+    assert.equal(stored.get('dup-first').number, 7, 'a valid stored value is never rewritten')
+    assert.equal(stored.get('dup-second').number, 7, 'nor is the loser of a duplicate rewritten')
+    assert.equal(stored.get('other').number, 3, 'nor is an unrelated valid value')
+    assert.equal(stored.get('late').number, read.get('late'), 'only the legacy record gains a number')
+    // The duplicate loser fell back to the smallest free position, 1, so the
+    // legacy record takes the next one — the same value it read before.
+    assert.equal(stored.get('late').number, 2, 'the legacy record persists the free position it read')
+    assert.equal(await readFile(backupOf(home), 'utf8'), seededText, 'the backup is the pre-migration document')
+  })
+})
+
+test('invalid stored numbers are replaced by the value the record reads', async () => {
+  const createdAt = Date.now() - 4000
+  const seeded = [
+    record({ id: 'z0', quote: '零', createdAt, number: 0 }),
+    record({ id: 'zneg', quote: '负', createdAt: createdAt + 1, number: -3 }),
+    record({ id: 'zfrac', quote: '小数', createdAt: createdAt + 2, number: 1.5 }),
+    record({ id: 'zstr', quote: '字符串', createdAt: createdAt + 3, number: '3' }),
+    record({ id: 'znan', quote: 'NaN', createdAt: createdAt + 4, number: Number.NaN }),
+    record({ id: 'znull', quote: 'null', createdAt: createdAt + 5, number: null }),
+  ]
+  await withPlugin(seeded, async ({ home, captured }) => {
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    const read = numbersOf(listed.payload)
+    assert.deepEqual([...read.values()].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6], 'the readings are 1..6')
+
+    const stored = await storedById(home)
+    for (const [id, number] of read) assert.equal(stored.get(id).number, number, `${id} persisted what it read`)
+    assert.deepEqual(
+      idOrderOf(await readDoc(home).then((doc) => doc.annotations)).map((id) => stored.get(id).number),
+      [1, 2, 3, 4, 5, 6],
+      'in creation order the stored numbers are 1..6',
+    )
+  })
+})
+
+test('the backfill is idempotent: a second load writes no byte and leaves no new backup', async () => {
+  const createdAt = Date.now() - 4000
+  await withPlugin(
+    [
+      record({ id: 'l1', quote: '旧一', createdAt }),
+      record({ id: 'l2', quote: '旧二', createdAt: createdAt + 1 }),
+      record({ id: 'l3', quote: '旧三', createdAt: createdAt + 2 }),
+    ],
+    async ({ home, captured }) => {
+      const first = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+      assert.deepEqual(
+        [...numbersOf(first.payload).values()].sort((a, b) => a - b),
+        [1, 2, 3],
+        'the first load backfilled 1..3',
+      )
+      const storeHash = await sha256Of(storeOf(home))
+      const storeStat = await stat(storeOf(home))
+      const backupStat = await stat(backupOf(home))
+      const backupBytes = await readFile(backupOf(home), 'utf8')
+
+      // Same home, second host half — the restart this has to survive.
+      const second = await bootPlugin()
+      await callApi(second.captured, { action: 'list', sessionId: 'session-alpha' })
+
+      assert.equal(await sha256Of(storeOf(home)), storeHash, 'the document is byte-identical')
+      assert.equal((await stat(storeOf(home))).mtimeMs, storeStat.mtimeMs, 'the second load did not even rewrite it')
+      const secondBackup = await stat(backupOf(home))
+      assert.equal(secondBackup.ino, backupStat.ino, 'the backup inode is unchanged')
+      assert.equal(backupStat.mode & 0o777, 0o600, 'the backup is 0600')
+      assert.equal(await readFile(backupOf(home), 'utf8'), backupBytes, 'the backup bytes are unchanged')
+      const entries = await readdir(join(home, 'annotations'))
+      assert.equal(entries.filter((entry) => entry.endsWith(BACKUP_SUFFIX)).length, 1, 'exactly one backup on disk')
+      assert.deepEqual(second.captured.warns, [], 'a completed backfill warns about nothing')
+      assert.deepEqual(second.captured.infos, [], 'and it says nothing either')
+    },
+  )
+})
+
+test('the pre-migration store is copied byte for byte at mode 0600', async () => {
+  const createdAt = Date.now() - 4000
+  const seeded = [record({ id: 'l1', quote: '旧一', createdAt }), record({ id: 'l2', quote: '旧二', createdAt: createdAt + 1 })]
+  const seededText = JSON.stringify({ version: 1, annotations: seeded }, null, 2)
+  const seedBytes = Buffer.from(seededText, 'utf8')
+  await withPlugin(seeded, async ({ home, captured }) => {
+    assert.equal((await readdir(join(home, 'annotations'))).length, 1, 'nothing but the store before the first read')
+    const seededSize = (await stat(storeOf(home))).size
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    assert.equal(listed.status, 200)
+    const backup = await readFile(backupOf(home))
+    assert.ok(
+      Buffer.compare(backup, seedBytes) === 0,
+      `the backup is the exact pre-migration bytes, got ${backup.length} vs ${seedBytes.length}`,
+    )
+    assert.equal((await stat(backupOf(home))).mode & 0o777, 0o600, 'the backup is 0600')
+    assert.ok(
+      (await stat(storeOf(home))).size > seededSize,
+      'the migrated store is longer than the seed: the numbers are in it',
+    )
+    assert.match(captured.infos.join('\n'), /backfilled 2 annotation number/, 'the boot reports what it wrote')
+  })
+})
+
+test('a pre-existing backup is never overwritten, and the backfill still runs', async () => {
+  const createdAt = Date.now() - 4000
+  const sentinel = 'an earlier migration backup\n'
+  await withPlugin(
+    [record({ id: 'l1', quote: '旧一', createdAt }), record({ id: 'l2', quote: '旧二', createdAt: createdAt + 1 })],
+    async ({ home, captured }) => {
+      await writeFile(backupOf(home), sentinel, 'utf8')
+      const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+      assert.equal(listed.status, 200)
+      assert.equal(await readFile(backupOf(home), 'utf8'), sentinel, 'the earliest copy is kept verbatim')
+      const stored = await storedById(home)
+      assert.equal(stored.get('l1').number, 1, 'the backfill still ran')
+      assert.equal(stored.get('l2').number, 2, 'the backfill still ran')
+      assert.deepEqual(captured.warns, [], 'an existing backup is not a failure')
+    },
+  )
+})
+
+test('when the backup cannot be written the store is left untouched and the next boot retries', async () => {
+  const createdAt = Date.now() - 4000
+  const seeded = [record({ id: 'l1', quote: '旧一', createdAt }), record({ id: 'l2', quote: '旧二', createdAt: createdAt + 1 })]
+  const seededText = JSON.stringify({ version: 1, annotations: seeded }, null, 2)
+  await withPlugin(seeded, async ({ home, captured }) => {
+    const dir = join(home, 'annotations')
+    const before = await sha256Of(storeOf(home))
+    await chmod(dir, 0o500)
+    try {
+      const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+      assert.equal(listed.status, 200, 'the plugin still answers when the backfill cannot write')
+      assert.equal(await sha256Of(storeOf(home)), before, 'the store keeps its bytes')
+      assert.equal(captured.warns.length, 1, `exactly one warning, got ${JSON.stringify(captured.warns)}`)
+      assert.match(String(captured.warns[0]), /pre-0.9.0 store backup/, 'the warning names the failed step')
+      assert.equal(await readFile(storeOf(home), 'utf8'), seededText, 'nothing was written to the store')
+      const readings = numbersOf(listed.payload)
+      assert.deepEqual(
+        idOrderOf(seeded).map((id) => readings.get(id)),
+        [1, 2],
+        'the read-time derivation still holds for this boot',
+      )
+      const entries = await readdir(dir)
+      assert.equal(entries.filter((entry) => entry.endsWith(BACKUP_SUFFIX)).length, 0, 'no backup could be created')
+    } finally {
+      await chmod(dir, 0o700)
+    }
+
+    // Reading the API again cannot tell "the legacy records have no number in
+    // memory" apart from "they were numbered before the backup failed":
+    // `numbering()` derives a position for a record without one, so both
+    // readings give 1 and 2. The next FLUSH is what separates them — with the
+    // numbers already in memory it would persist them, and the store would carry
+    // a backfill whose backup never landed. So the directory being writable
+    // again, a `create()` is driven and the file is read back.
+    const created = await callApi(captured, {
+      action: 'create',
+      sessionId: 'session-alpha',
+      annotation: { sessionId: 'session-alpha', quote: '新记录' },
+    })
+    assert.equal(created.status, 200)
+    assert.equal(created.payload.annotation.number, 3, 'a new record continues from the derived maximum (1, 2)')
+    const flushed = await storedById(home)
+    assert.equal(
+      'number' in flushed.get('l1'),
+      false,
+      'a failed backup must leave the legacy records unnumbered in memory, so no later flush can persist them',
+    )
+    assert.equal(
+      'number' in flushed.get('l2'),
+      false,
+      'a failed backup must leave the legacy records unnumbered in memory, so no later flush can persist them',
+    )
+
+    const second = await bootPlugin()
+    const retried = await callApi(second.captured, { action: 'list', sessionId: 'session-alpha' })
+    assert.equal(retried.status, 200)
+    const stored = await storedById(home)
+    assert.equal(stored.get('l1').number, 1, 'the next boot completes the backfill')
+    assert.equal(stored.get('l2').number, 2, 'the next boot completes the backfill')
+    assert.equal(stored.get(created.payload.annotation.id).number, 3, 'and the persisted newcomer is not renumbered')
+    assert.deepEqual(second.captured.warns, [], 'and warns about nothing')
+  })
+})
+
+test('a throw out of the backfill is contained, never treated as a corrupt store', async () => {
+  const createdAt = Date.now() - 4000
+  const seeded = [
+    record({ id: 'l1', quote: '旧一', createdAt }),
+    record({ id: 'l2', quote: '旧二', createdAt: createdAt + 1 }),
+    record({ id: 'l3', quote: '旧三', createdAt: createdAt + 2 }),
+  ]
+  const seededText = JSON.stringify({ version: 1, annotations: seeded }, null, 2)
+  const sentinel = 'a backup from an earlier run\n'
+  await withPlugin(
+    seeded,
+    async ({ home, captured }) => {
+      const dir = join(home, 'annotations')
+      // A backup from an earlier run sits beside the store, so the backfill takes
+      // its `EEXIST` branch and reports that through `logger.info` — and the
+      // injected logger throws (see `fakeContext`). The throw escapes
+      // `backfillNumbers()` from a point where nothing has been written yet,
+      // which is exactly the "unexpected throw during load" the loader has to
+      // contain. The alternative a reader might expect — an fs error — cannot be
+      // made to escape: every filesystem failure inside the migration is caught
+      // by the migration, so only an injected collaborator can do this.
+      await writeFile(backupOf(home), sentinel, 'utf8')
+
+      const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+      assert.equal(listed.status, 200, 'a throw out of the backfill does not take the plugin down')
+
+      // 1) the store was NOT mistaken for a corrupt document...
+      const entries = await readdir(dir)
+      assert.equal(
+        entries.some((entry) => entry.startsWith('annotations.json.corrupt-')),
+        false,
+        `the store must not be moved aside as corrupt, got ${JSON.stringify(entries)}`,
+      )
+      assert.equal(entries.includes('annotations.json'), true, 'the store is still where it was')
+      // 2) ...its bytes are untouched, and so is the backup already on disk...
+      assert.equal(await readFile(storeOf(home), 'utf8'), seededText, 'nothing was written to the store')
+      assert.equal(await readFile(backupOf(home), 'utf8'), sentinel, 'and the existing backup is untouched')
+      // 3) ...the failure is reported as a backfill failure...
+      assert.equal(captured.warns.length, 1, `exactly one warning, got ${JSON.stringify(captured.warns)}`)
+      assert.match(String(captured.warns[0]), /annotation number backfill failed/, 'the warning names the backfill')
+      // 4) ...and this boot keeps reading the derived numbers, none of the
+      // records having been given one.
+      const readings = numbersOf(listed.payload)
+      assert.deepEqual(
+        idOrderOf(seeded).map((id) => readings.get(id)),
+        [1, 2, 3],
+        'the read-time derivation still holds for this boot',
+      )
+    },
+    { infoThrows: true },
+  )
+})
+
+test('when the store cannot be written the memory is rolled back and the next boot retries', async () => {
+  const createdAt = Date.now() - 4000
+  const seeded = [record({ id: 'l1', quote: '旧一', createdAt }), record({ id: 'l2', quote: '旧二', createdAt: createdAt + 1 })]
+  await withPlugin(seeded, async ({ home, captured }) => {
+    const store = storeOf(home)
+    const before = await sha256Of(store)
+    // `writeAtomic` names its temp file `<store>.tmp-<pid>-<Date.now()>`, so with
+    // the clock frozen a directory on that exact path makes the temp WRITE fail
+    // (EISDIR) while the backup, a different name, still succeeds. This is the
+    // one way to fail the store write deterministically.
+    const realNow = Date.now
+    Date.now = () => createdAt
+    const blocker = `${store}.tmp-${process.pid}-${createdAt}`
+    try {
+      await mkdir(blocker)
+      const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+      assert.equal(listed.status, 200, 'the plugin still answers after a failed store write')
+      assert.equal(await sha256Of(store), before, 'the store keeps its bytes')
+      await stat(backupOf(home)) // the backup is written before the store is touched
+      assert.equal(captured.warns.length, 1, `exactly one warning, got ${JSON.stringify(captured.warns)}`)
+      assert.match(String(captured.warns[0]), /backfilled annotation numbers/, 'the warning names the failed write')
+
+      await rm(blocker, { recursive: true, force: true })
+      const created = await callApi(captured, {
+        action: 'create',
+        sessionId: 'session-alpha',
+        annotation: { sessionId: 'session-alpha', quote: '新记录' },
+      })
+      assert.equal(created.status, 200)
+      const persisted = await storedById(home)
+      assert.equal(
+        created.payload.annotation.number,
+        3,
+        'the new record continues from the derived maximum the session still reads',
+      )
+      assert.equal(
+        persisted.get('l1').number,
+        undefined,
+        'the rolled-back numbers are not what the created record continued from',
+      )
+      assert.equal(
+        'number' in persisted.get('l1'),
+        false,
+        'a later flush must not persist the rolled-back numbers',
+      )
+      assert.equal('number' in persisted.get('l2'), false, 'a later flush must not persist the rolled-back numbers')
+    } finally {
+      Date.now = realNow
+    }
+
+    const second = await bootPlugin()
+    await callApi(second.captured, { action: 'list', sessionId: 'session-alpha' })
+    const after = await storedById(home)
+    assert.equal(after.get('l1').number, 1, 'the next boot completes the backfill')
+    assert.equal(after.get('l2').number, 2, 'the next boot completes the backfill')
+  })
+})
+
+test('the backfill never trims a session over the per-session limit', async () => {
+  const MAX_PER_SESSION = 400
+  const createdAt = Date.now() - 600000
+  const many = []
+  for (let index = 0; index < MAX_PER_SESSION + 12; index += 1) {
+    many.push(record({ id: `many-${String(index).padStart(4, '0')}`, quote: `第${index}处`, createdAt: createdAt + index }))
+  }
+  await withPlugin(many, async ({ home, captured }) => {
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    const read = numbersOf(listed.payload)
+    const doc = await readDoc(home)
+    assert.equal(doc.annotations.length, many.length, 'the backfill is not a write path and never trims')
+    assert.equal(read.size, many.length, 'every record still reads a number')
+    assert.equal(new Set(read.values()).size, many.length, 'and no two read the same one')
+    for (const item of doc.annotations) assert.ok(Number.isInteger(item.number) && item.number >= 1, 'each has a stored number')
+    assert.equal(captured.warns.length, 0, 'nothing to warn about')
+  })
+})
+
+test('the backfill runs per session, independently', async () => {
+  const createdAt = Date.now() - 4000
+  const seeded = [
+    record({ id: 'a1', sessionId: 'session-alpha', quote: 'A1', createdAt }),
+    record({ id: 'a2', sessionId: 'session-alpha', quote: 'A2', createdAt: createdAt + 1 }),
+    record({ id: 'b1', sessionId: 'session-beta', quote: 'B1', createdAt, number: 4 }),
+    record({ id: 'b2', sessionId: 'session-beta', quote: 'B2', createdAt: createdAt + 1 }),
+  ]
+  await withPlugin(seeded, async ({ home, captured }) => {
+    const alpha = numbersOf((await callApi(captured, { action: 'list', sessionId: 'session-alpha' })).payload)
+    const beta = numbersOf((await callApi(captured, { action: 'list', sessionId: 'session-beta' })).payload)
+    assert.deepEqual([...alpha.values()].sort((a, b) => a - b), [1, 2], 'the other session never lends a number')
+    assert.equal(beta.get('b1'), 4, 'a stored number is kept')
+    assert.equal(beta.get('b2'), 1, 'the legacy record takes the smallest free position of its own session')
+    const stored = await storedById(home)
+    for (const [id, number] of new Map([...alpha, ...beta])) {
+      assert.equal(stored.get(id).number, number, `${id} persisted what it read`)
+    }
+    assert.equal(stored.get('a1').number, 1, 'sessions compute their numbers from their own records only')
+  })
+})
+
+test('a missing or empty store is neither created nor backed up', async () => {
+  await withPlugin([], async ({ home, captured }) => {
+    const dir = join(home, 'annotations')
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    assert.equal(listed.status, 200)
+    assert.deepEqual(await readdir(dir), ['annotations.json'], 'an empty document is not rewritten')
+    assert.deepEqual(captured.warns, [], 'and nothing is warned about')
+  })
+
+  const empty = await mkdtemp(join(tmpdir(), 'dsa-test-'))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = empty
+  try {
+    await mkdir(join(empty, 'annotations'), { recursive: true })
+    const booted = await bootPlugin()
+    const listed = await callApi(booted.captured, { action: 'list', sessionId: 'session-alpha' })
+    assert.equal(listed.status, 200)
+    assert.deepEqual(await readdir(join(empty, 'annotations')), [], 'a missing store is not created')
+    assert.deepEqual(booted.captured.warns, [], 'and nothing is warned about')
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await rm(empty, { recursive: true, force: true })
+  }
+})
+
+test('a corrupt store is moved aside and is never backed up', async () => {
+  await withPlugin([record({ id: 'a1' })], async ({ home, captured }) => {
+    const dir = join(home, 'annotations')
+    await writeFile(storeOf(home), '{ 不是 JSON', 'utf8')
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    assert.equal(listed.status, 200, 'a corrupt document does not take the plugin down')
+    const entries = await readdir(dir)
+    assert.ok(
+      entries.some((entry) => entry.startsWith('annotations.json.corrupt-')),
+      `the unparsable document is moved aside, got ${JSON.stringify(entries)}`,
+    )
+    assert.equal(entries.filter((entry) => entry.endsWith(BACKUP_SUFFIX)).length, 0, 'a document with no records is not backed up')
+    assert.deepEqual(captured.warns, [], 'and it is not a backfill failure')
+  })
+})
+
+test('deleting an earlier backfilled record does not move the survivors', async () => {
+  const createdAt = Date.now() - 4000
+  await withPlugin(
+    [
+      record({ id: 'd1', quote: '第一处', createdAt }),
+      record({ id: 'd2', quote: '第二处', createdAt: createdAt + 1 }),
+      record({ id: 'd3', quote: '第三处', createdAt: createdAt + 2 }),
+    ],
+    async ({ home, captured }) => {
+      const before = numbersOf((await callApi(captured, { action: 'list', sessionId: 'session-alpha' })).payload)
+      assert.deepEqual([before.get('d1'), before.get('d2'), before.get('d3')], [1, 2, 3], 'the fixture starts at 1..3')
+
+      const removed = await callApi(captured, { action: 'delete', id: 'd1' })
+      assert.equal(removed.status, 200)
+      const after = numbersOf(removed.payload)
+      assert.equal(after.get('d2'), before.get('d2'), 'deleting the earliest does not slide d2 down')
+      assert.equal(after.get('d3'), before.get('d3'), 'nor d3')
+
+      const reread = numbersOf((await callApi(captured, { action: 'list', sessionId: 'session-alpha' })).payload)
+      assert.equal(reread.get('d2'), before.get('d2'), 'and a fresh read agrees')
+      assert.equal(reread.get('d3'), before.get('d3'), 'and a fresh read agrees')
+      const stored = await storedById(home)
+      assert.equal(stored.get('d2').number, before.get('d2'), 'the stored value is stable too')
+      assert.equal(stored.get('d3').number, before.get('d3'), 'the stored value is stable too')
+    },
+  )
 })
 
 /* ---------------------------- delivery gate coverage (gaps closed here) ---- */

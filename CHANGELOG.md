@@ -4,6 +4,68 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-09
+
+### Fixed
+
+- **A record written before 0.8.0 carries no `number` on disk, so it was still
+  numbered by position: deleting an earlier legacy annotation moved every later
+  one.** 0.8.0 made the number an identity for records created from then on
+  (`AnnotationStore.create` writes `max(what the session reads) + 1`,
+  `normalizeRecord` keeps it), but the records already on disk carried no such
+  field, so `numbering()` derived their value from `createdAt` order on every
+  read — the defect 0.8.0 had just closed came back the moment the deleted
+  annotation was older than 0.8.0. Reproduced on a copy of a real store:
+  deleting the earliest annotation of a 20-record session moved a surviving
+  record from 20 to 19.
+
+  The host half now **backfills the missing numbers once, when it loads the
+  store** (`AnnotationStore.backfillNumbers`, called from `load()` after the
+  document is parsed and before the store is marked loaded):
+
+  - only a record whose stored value is missing or invalid (not an integer of at
+    least 1) is written; a value already on disk is never changed, and the
+    backfill never adds, removes or reorders a record, never touches another
+    field, and never trims the per-session limit;
+  - the value written is exactly what `numbering()` already reported for that
+    record — the one function every projection reads — so **no annotation's
+    number changes**: a session with no stored numbers is still `1..N` in
+    creation order, and a mixed session keeps its stored values and fills the
+    legacy ones with the smallest free positions, exactly as before;
+  - numbering stays per session, and a duplicated stored value keeps its
+    definite reading (the earliest record in `createdAt` order keeps the value,
+    the others keep reading the free position, and neither is rewritten);
+  - because every read and write path awaits `load()` first, the backfill is
+    complete before the first `flush()` of the boot.
+
+### Added
+
+- **A one-shot copy of the store before the backfill writes anything.** The
+  document is copied, byte for byte, to
+  `$DSH_HOME/annotations/annotations.json.migrate-0.9.0.bak` (mode `0600`)
+  before a single in-memory number is changed; an existing backup is kept
+  verbatim and no second one is created. If that copy cannot be written the
+  backfill is abandoned for this boot — the store is left exactly as it was, a
+  warning names the step, and the next boot retries. A failed store write is
+  equally safe: the document is written to a temp file and renamed, and the
+  in-memory backfill is rolled back, so the file on disk keeps its pre-migration
+  bytes and a later flush cannot persist the rolled-back numbers either.
+
+### Changed
+
+- The `annotation` tool now reports `revision: 10` (`REVISION` 9 → 10) and
+  `package.json` version and both READMEs' version badge: `0.8.0` → `0.9.0`.
+  Both READMEs' numbering row now says the pre-0.8.0 records are backfilled once
+  at plugin start (so the "session-stable" promise covers them too), the
+  limitation that lists what is per session no longer says legacy records walk
+  the positional path, and the storage row names the backup file.
+- Why **0.9.0** and not a patch: every record in the store starts carrying a
+  `number`, and one more file appears next to it — a visible change to persisted
+  data and to the storage footprint, the same class of change 0.6.0 and 0.8.0
+  shipped as minor.
+
+[0.9.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.8.0...v0.9.0
+
 ## [0.8.0] - 2026-10-08
 
 ### Fixed
