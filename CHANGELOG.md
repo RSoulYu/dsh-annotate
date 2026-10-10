@@ -73,6 +73,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The repository suite is 150/150 locally (host shape fence included, DSH host
   present), stable over repeated runs.
 
+[0.10.1]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.0...v0.10.1
+
 ## [0.10.0] - 2026-10-09
 
 ### Fixed
@@ -171,6 +173,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   session-switch abort and the missing-service degradation — all asserted against
   the frozen decision table.
 - `test/freeze-clock.mjs`: the `Date.now()`-frozen run.
+
+[0.10.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.9.0...v0.10.0
 
 ## [0.9.0] - 2026-10-09
 
@@ -415,6 +419,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   line with the behavior above (0.7.0 adds 8 host cases and rewrites the badge
   cases; `node --test` reports 67 tests). Re-anchoring, jump-to-source and receipt
   confirmation were not touched.
+
+[0.7.0]: https://github.com/RSoulYu/dsh-annotate/compare/v0.6.0...v0.7.0
 
 ## [0.6.0] - 2026-10-06
 
