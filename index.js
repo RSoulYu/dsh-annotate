@@ -535,6 +535,22 @@ class AnnotationStore {
       .sort((a, b) => a.createdAt - b.createdAt)
   }
 
+  /**
+   * Admit one annotation into its session.
+   *
+   * The per-session maximum is hard. Leaving it is only allowed by evicting
+   * older DELIVERED records — never a pending one, which is the promise the
+   * README makes — so a create that would leave the session above the maximum
+   * with too few delivered records to evict is REFUSED: the record is rolled
+   * back off the list and nothing is written. Refusing is the only option that
+   * keeps both halves of that promise; the alternative is an unbounded store
+   * whose every save re-serializes a larger document.
+   *
+   * @param {object} input the annotation to create.
+   * @returns the admitted record.
+   * @throws when the session is at its maximum and the overflow cannot be
+   *   absorbed by evicting delivered records.
+   */
   async create(input) {
     const sessionId = asId(input.sessionId)
     if (sessionId.length === 0) throw new Error('sessionId is required')
@@ -565,15 +581,35 @@ class AnnotationStore {
     this.state.annotations.push(record)
     const forSession = this.state.annotations.filter((item) => item.sessionId === record.sessionId)
     if (forSession.length > MAX_PER_SESSION) {
-      // Oldest delivered first; pending records are never dropped.
       const overflow = forSession.length - MAX_PER_SESSION
-      const doomed = new Set(
-        forSession
-          .filter((item) => item.status === 'delivered')
-          .sort((a, b) => a.createdAt - b.createdAt)
-          .slice(0, overflow)
-          .map((item) => item.id),
-      )
+      // Oldest delivered first; pending records are never dropped. The pool is
+      // measured before anything is evicted, because the question the next
+      // branch asks is whether that pool can absorb the WHOLE overflow.
+      const evictable = forSession
+        .filter((item) => item.status === 'delivered')
+        .sort((a, b) => a.createdAt - b.createdAt)
+      if (overflow > evictable.length) {
+        // The pool is too small for the overflow, and a pending record is never
+        // dropped, so this create cannot be admitted. `slice()` would quietly
+        // return fewer records than `overflow` and leave the excess on the
+        // list: the session would pass 400, and the only hard ceiling would be
+        // gone — every save would serialize an ever larger document.
+        // Roll the record back completely: it must not stay on the list, and it
+        // must not flush, or the rejected annotation would reach disk anyway.
+        // The roll-back also leaves the numbering untouched: a refusal consumes
+        // no number and opens no hole, so the next annotation still takes
+        // `highest-read + 1` and a session's numbers never skip a value BECAUSE
+        // of a refusal. Whether the freed slot itself comes back is a separate,
+        // pre-existing question — `numbering()` backfills a record that has no
+        // stored number into the smallest free slot, so a session still holding
+        // such a legacy record hands that slot to it and the next annotation
+        // takes the following number instead.
+        this.state.annotations = this.state.annotations.filter((item) => item.id !== record.id)
+        throw new Error(
+          `session is at the ${MAX_PER_SESSION}-annotation limit; delete or clear delivered annotations to add more`,
+        )
+      }
+      const doomed = new Set(evictable.slice(0, overflow).map((item) => item.id))
       this.state.annotations = this.state.annotations.filter((item) => !doomed.has(item.id))
     }
     await this.flush()

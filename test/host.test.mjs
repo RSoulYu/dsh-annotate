@@ -1929,3 +1929,272 @@ test('the reported incident shape: a tool-jobs notice takes no annotations', asy
     assert.deepEqual(await readdir(dir), ['annotations.json'], 'the store was never read')
   })
 })
+
+/**
+ * The per-session ceiling, driven through the real API and the real store file.
+ *
+ * `create` admits a record only if the session can stay within
+ * `MAX_PER_SESSION` AFTER evicting delivered records — the pending ones are
+ * never dropped, so when the overflow is larger than the delivered pool there
+ * is nothing left to give and the create is refused. Before this the eviction
+ * was a `slice(0, overflow)` over that pool: a short pool silently returned
+ * fewer records than the overflow asked for, the excess stayed on the list, and
+ * the session grew without bound — reachable in normal use, since clicking
+ * "clear delivered" empties the pool and every later create then overflows it.
+ *
+ * These assert the boundary from BOTH sides: the refusal, and the eviction that
+ * must keep working beside it. A fix that refused too eagerly would pass the
+ * first test and fail the second.
+ */
+test('a create that cannot fit under the per-session limit is refused, and nothing is written', async () => {
+  const MAX_PER_SESSION = 400
+  const createdAt = Date.now() - 600000
+  const full = []
+  for (let index = 0; index < MAX_PER_SESSION; index += 1) {
+    full.push(record({ id: `p${index}`, quote: `第${index}处`, createdAt: createdAt + index, number: index + 1 }))
+  }
+  await withPlugin(full, async ({ home, captured }) => {
+    const before = await readDoc(home)
+
+    const refused = await callApi(captured, {
+      action: 'create',
+      sessionId: 'session-alpha',
+      annotation: { sessionId: 'session-alpha', quote: '放不下了' },
+    })
+
+    assert.ok(refused.status >= 400 && refused.status < 500, 'the caller is told, not lied to')
+    assert.equal(refused.payload.ok, false, 'the browser half rejects on ok !== true')
+    assert.match(refused.payload.error, /400-annotation limit/, 'the reason names the real cause, not a generic failure')
+
+    const after = await readDoc(home)
+    assert.equal(after.annotations.length, MAX_PER_SESSION, 'the ceiling really holds')
+    assert.equal(after.annotations.length, before.annotations.length, 'nothing was written at all')
+    assert.deepEqual(idOrderOf(after.annotations), idOrderOf(before.annotations), 'the roll-back left the list exactly as it was')
+    assert.equal(after.annotations.some((item) => item.quote === '放不下了'), false, 'the refused record is not on the list')
+    assert.equal(after.annotations.every((item) => item.status === 'pending'), true, 'and no pending record was dropped to make room')
+
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    assert.equal(listed.payload.annotations.length, MAX_PER_SESSION, 'the browser reads back the same ceiling')
+  })
+})
+
+test('repeated refused creates never let the session pass the limit', async () => {
+  const MAX_PER_SESSION = 400
+  const createdAt = Date.now() - 600000
+  const full = []
+  for (let index = 0; index < MAX_PER_SESSION; index += 1) {
+    full.push(record({ id: `p${index}`, quote: `第${index}处`, createdAt: createdAt + index, number: index + 1 }))
+  }
+  await withPlugin(full, async ({ home, captured }) => {
+    // The original defect did not stop at 401: a session with an empty
+    // delivered pool kept growing on every create (461 was measured). Two
+    // refusals in a row prove there is no slow creep either.
+    for (const quote of ['第一次溢出', '第二次溢出']) {
+      const refused = await callApi(captured, {
+        action: 'create',
+        sessionId: 'session-alpha',
+        annotation: { sessionId: 'session-alpha', quote },
+      })
+      assert.equal(refused.payload.ok, false, `${quote} is refused`)
+    }
+    const after = await readDoc(home)
+    assert.equal(after.annotations.length, MAX_PER_SESSION, 'still exactly at the ceiling')
+  })
+})
+
+test('a refused create consumes no number and opens no hole in the sequence', async () => {
+  const MAX_PER_SESSION = 400
+  const createdAt = Date.now() - 600000
+  const full = []
+  for (let index = 0; index < MAX_PER_SESSION; index += 1) {
+    full.push(record({ id: `p${index}`, quote: `第${index}处`, createdAt: createdAt + index, number: index + 1 }))
+  }
+  await withPlugin(full, async ({ home, captured }) => {
+    // Refuse K times in a row, then free exactly one slot and create once.
+    //
+    // The number this last annotation takes is what tells the two possible
+    // implementations apart, and it is why the assertions below are shaped the
+    // way they are:
+    //
+    //   - refusal truly consumes nothing -> the sequence is untouched, so the
+    //     new record takes 400. K refusals leave it at 400, not 400 + K.
+    //   - refusal leaks the number it had handed out (e.g. the record is left
+    //     on the list) -> the sequence has advanced K times and the new record
+    //     takes 400 + K, which is what a per-refusal leak looks like.
+    //
+    // An assertion of the form `number === 400` after ONE refusal is satisfied
+    // by BOTH shapes, so it proves nothing; pinning the RELATION between K and
+    // the resulting number is what makes the test a real fence. The count and
+    // distinctness checks below cover the other half: no value may be handed
+    // out twice, and the gap-free property must hold across the whole session.
+    const refusals = 3
+    for (let attempt = 0; attempt < refusals; attempt += 1) {
+      const refused = await callApi(captured, {
+        action: 'create',
+        sessionId: 'session-alpha',
+        annotation: { sessionId: 'session-alpha', quote: `被拒的${attempt}` },
+      })
+      assert.equal(refused.payload.ok, false, `refusal ${attempt + 1} is reported`)
+      assert.equal(
+        refused.payload.annotation,
+        undefined,
+        'a refused create returns no record at all',
+      )
+    }
+    assert.equal(
+      (await readDoc(home)).annotations.length,
+      MAX_PER_SESSION,
+      'three refusals still left the session at the ceiling',
+    )
+
+    const removed = await callApi(captured, { action: 'delete', id: 'p399' })
+    assert.equal(removed.status, 200, 'one slot is freed')
+
+    const admitted = await callApi(captured, {
+      action: 'create',
+      sessionId: 'session-alpha',
+      annotation: { sessionId: 'session-alpha', quote: '补上的' },
+    })
+    assert.equal(admitted.status, 200)
+    assert.equal(
+      admitted.payload.annotation.number,
+      MAX_PER_SESSION,
+      `${refusals} refusals consumed no number: the next annotation takes ${MAX_PER_SESSION}, not ${MAX_PER_SESSION + refusals}`,
+    )
+
+    // The whole session still reads a gap-free, duplicate-free sequence.
+    const listed = await callApi(captured, { action: 'list', sessionId: 'session-alpha' })
+    const numbers = listed.payload.annotations.map((item) => item.number)
+    assert.equal(numbers.length, MAX_PER_SESSION, 'the ceiling is intact')
+    assert.equal(new Set(numbers).size, numbers.length, 'no two annotations read the same number')
+    assert.equal(Math.max(...numbers), MAX_PER_SESSION, 'and the sequence did not run past the ceiling')
+
+    assert.equal((await readDoc(home)).annotations.length, MAX_PER_SESSION, 'nothing leaked to disk either')
+  })
+})
+
+test('eviction still absorbs an overflow the delivered pool can cover', async () => {
+  const MAX_PER_SESSION = 400
+  const createdAt = Date.now() - 600000
+  const full = []
+  for (let index = 0; index < MAX_PER_SESSION; index += 1) {
+    full.push(
+      record({
+        id: `d${index}`,
+        quote: `第${index}处`,
+        status: 'delivered',
+        deliveredAt: createdAt + index,
+        deliveredTurn: index,
+        createdAt: createdAt + index,
+        number: index + 1,
+      }),
+    )
+  }
+  await withPlugin(full, async ({ home, captured }) => {
+    const created = await callApi(captured, {
+      action: 'create',
+      sessionId: 'session-alpha',
+      annotation: { sessionId: 'session-alpha', quote: '最新的一条' },
+    })
+
+    assert.equal(created.status, 200, 'a full session of delivered records still has room')
+    const doc = await readDoc(home)
+    assert.equal(doc.annotations.length, MAX_PER_SESSION, 'stays at the ceiling')
+    const ids = new Set(doc.annotations.map((item) => item.id))
+    assert.equal(ids.has('d0'), false, 'the OLDEST delivered record went')
+    assert.equal(ids.has('d1'), true, 'and only that one')
+    assert.equal(doc.annotations.filter((item) => item.status === 'delivered').length, MAX_PER_SESSION - 1)
+    assert.equal(
+      doc.annotations.find((item) => item.quote === '最新的一条').number,
+      MAX_PER_SESSION + 1,
+      'the newcomer continues the running maximum',
+    )
+    assert.equal(created.payload.annotations.length, MAX_PER_SESSION, 'the browser reads back the same list')
+  })
+})
+
+test('an overflow larger than the delivered pool is refused before any pending record is touched', async () => {
+  const MAX_PER_SESSION = 400
+  const createdAt = Date.now() - 600000
+  const seeded = [
+    record({
+      id: 'd0',
+      quote: '一条已送达',
+      status: 'delivered',
+      deliveredAt: createdAt,
+      deliveredTurn: 1,
+      createdAt,
+      number: 1,
+    }),
+  ]
+  for (let index = 0; index < MAX_PER_SESSION - 1; index += 1) {
+    seeded.push(
+      record({ id: `p${index}`, quote: `第${index}处`, createdAt: createdAt + index + 1, number: index + 2 }),
+    )
+  }
+  await withPlugin(seeded, async ({ home, captured }) => {
+    // 397 in the session with one delivered record free to go: the first create
+    // fits by evicting it, and every create after that has an empty pool.
+    let first
+    for (let index = 0; index < 4; index += 1) {
+      first = await callApi(captured, {
+        action: 'create',
+        sessionId: 'session-alpha',
+        annotation: { sessionId: 'session-alpha', quote: `新增-${index}` },
+      })
+    }
+
+    assert.equal(first.status, 400, 'the creates past the ceiling are refused')
+    const doc = await readDoc(home)
+    const pending = doc.annotations.filter((item) => item.status === 'pending')
+    assert.equal(doc.annotations.length, MAX_PER_SESSION, 'the ceiling holds')
+    assert.equal(doc.annotations.some((item) => item.id === 'd0'), false, 'the one evictable record was used first')
+    assert.equal(pending.length, MAX_PER_SESSION, 'every pending record is still there: not one was dropped for room')
+    for (let index = 0; index < MAX_PER_SESSION - 1; index += 1) {
+      assert.ok(
+        doc.annotations.some((item) => item.id === `p${index}`),
+        `pending p${index} survived`,
+      )
+    }
+  })
+})
+
+test('re-queueing every record cannot carry a session past the limit', async () => {
+  const MAX_PER_SESSION = 400
+  const createdAt = Date.now() - 600000
+  const delivered = []
+  for (let index = 0; index < MAX_PER_SESSION; index += 1) {
+    delivered.push(
+      record({
+        id: `d${index}`,
+        quote: `第${index}处`,
+        status: 'delivered',
+        deliveredAt: createdAt + index,
+        deliveredTurn: index,
+        createdAt: createdAt + index,
+        number: index + 1,
+      }),
+    )
+  }
+  await withPlugin(delivered, async ({ home, captured }) => {
+    // `redeliver` is the widest form of the path that empties the eviction
+    // pool. It only flips `status`, so it can never ADD a record and the total
+    // cannot move; what it CAN do is leave the next create with nothing to
+    // evict — which is exactly the case the refusal branch exists for.
+    for (const item of delivered) {
+      const requeued = await callApi(captured, { action: 'redeliver', id: item.id })
+      assert.equal(requeued.status, 200)
+    }
+    const afterRequeue = await readDoc(home)
+    assert.equal(afterRequeue.annotations.length, MAX_PER_SESSION, 're-queueing is length-preserving, not a growth path')
+    assert.equal(afterRequeue.annotations.every((item) => item.status === 'pending'), true, 'the pool is now empty')
+
+    const refused = await callApi(captured, {
+      action: 'create',
+      sessionId: 'session-alpha',
+      annotation: { sessionId: 'session-alpha', quote: '池子空了' },
+    })
+    assert.equal(refused.payload.ok, false, 'an empty eviction pool refuses the write instead of breaching the ceiling')
+    assert.equal((await readDoc(home)).annotations.length, MAX_PER_SESSION, 'and the ceiling still holds afterwards')
+  })
+})

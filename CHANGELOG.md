@@ -4,6 +4,92 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.5] - 2026-10-14
+
+### Fixed
+
+- **The per-session limit of 400 did not hold, and a session could grow without
+  bound.** The eviction in `AnnotationStore.create` was a
+  `slice(0, overflow)` over the session's *delivered* records. `slice` returns
+  **fewer** records than asked for when the pool is short, and the shortfall was
+  never handled: the excess stayed on the list, past the ceiling, with nothing
+  that would ever bring it back. The trigger is not "an all-pending session" —
+  it is simply **an overflow larger than the pool of delivered records**, so it
+  is reachable in ordinary use: click **"clear delivered"** once, the pool is
+  empty, and from then on every create overflows it. It was measured, on the
+  shipped code, at 401 records with an empty pool and still climbing at 461 —
+  no self-correction at any point. Because `flush()` re-serializes the **whole**
+  document on every write, unbounded growth is not just disk: every "save
+  annotation" gets slower with the size of the session.
+
+  `create` now decides against the **whole** overflow: it evicts the oldest
+  delivered records when that pool can cover it (unchanged behaviour), and
+  otherwise **refuses the create** — the new record is rolled back off the list,
+  nothing is flushed, and the refusal **consumes no number and leaves no hole**:
+  the next annotation still takes `highest-read + 1`, so a session's numbers
+  never skip a value *because* of a refusal. (A refused create therefore does not
+  advance the sequence the way an accepted one does. Whether the freed number
+  itself comes back depends on the session: with every record carrying a stored
+  `number`, the deleted maximum frees the top slot and the next annotation does
+  take it; when the session still holds an **unnumbered** legacy record, the
+  `numbering()` backfill hands that record the freed slot instead, so the
+  highest read number is unchanged and the next annotation takes the following
+  one. Both are the pre-existing `numbering()` semantics, untouched here.) This
+  is a **user-visible
+  behaviour change on one path**: where the old code accepted the write and
+  returned HTTP 200, the session is now full and the write is refused with HTTP
+  400. The browser half needs no change — it already rejects on `ok !== true`
+  and shows "save failed" — and the server message now names the real cause
+  (`session is at the 400-annotation limit; delete or clear delivered
+  annotations to add more`) so it is distinguishable from a service that is
+  down.
+
+  The alternative — evicting pending records — was rejected outright: "pending
+  annotations are never dropped" is the promise this plugin makes, and silently
+  discarding a user's annotation is the worst failure it could have. Allowing
+  the breach and merely warning about it was rejected too: without a real
+  ceiling there is no convergence, which is the one thing the limit exists for.
+  Refusing is the only option that keeps **both** halves — never lose an
+  accepted annotation, and never grow without bound — and it says so honestly
+  instead of pretending there is always room.
+
+  The limit had **no test coverage at all**: the only test that mentioned 400
+  exercised the number-backfill path, which is not a write path and never
+  touches this branch. Six tests now pin the ceiling from both sides — the
+  refusal, the repeat-refusal that proves there is no creep, the numbering that
+  a refusal must not perturb, the eviction that must keep working, the mixed
+  case where an overflow larger than the pool must not cost a single pending
+  record, and the re-queue path that empties the pool — and
+  `test/ceiling.mutations.sh` shows each of them going red when the fix is
+  reverted, when it refuses one record too early, when the roll-back is
+  skipped, and when a refusal leaks the number it was handed. That last control
+  is why the numbering assertion states a **relation** — three refusals, then
+  the next annotation must still take 400 — rather than one value: a leaked
+  number leaves the first free value unchanged, so a single-value assertion
+  holds under both implementations and guards nothing.
+
+  **An already-breached document is not repaired.** A session that the old code
+  had already pushed past 400 (the 461 measured above) stops growing from the
+  first boot on this version and no pending record is ever deleted to shrink it
+  — but it is **not** converged back to the ceiling either: it stays at its
+  existing size and every further create against it is refused, because the
+  eviction pool is what would have to absorb the overflow and the overflow now
+  exceeds it. Such a session is recovered by the user, through the actions the
+  refusal message names: delete annotations, or clear the delivered ones, until
+  the session is back under the limit. This is deliberate — silently deleting
+  annotations to make a number come out right is exactly the loss this plugin
+  refuses to commit.
+
+### Changed
+
+- **`README.md` / `README.en.md`, "Data and privacy" table.** The capacity row
+  said over-limit writes "clean the oldest delivered first and pending ones are
+  never dropped", which silently implied the overflow could *always* be
+  absorbed. The ceiling and the never-drop promise are both kept; the row now
+  states the third case as well — when there is not enough delivered history to
+  clean, a new annotation is refused and reported on the spot, and nothing that
+  already exists is lost. The declaration now matches the implementation.
+
 ## [0.10.4] - 2026-10-13
 
 ### Fixed
@@ -99,6 +185,69 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and its real logs, and by `test/reconcile.mutations.sh`, whose five mutations
   each turn the drive red. The `annotation` tool reports revision 11.
 
+## [0.10.2] - 2026-10-13
+
+### Fixed
+
+- **The host-shape fence ran nowhere.** CI set
+  `DSH_ANNOTATE_HOST_ROOT=absent`, so all 22 string assertions — the mechanical
+  fence against the host's public session face — were skipped in every run. The
+  fence was only as strong as the machine that remembered to run it by hand. A
+  new `host-shape` job installs the published host into an npm **install
+  prefix** (pinned to `0.2.0-rc.2`) and runs the fence against it, with the skip
+  line refused as a result: the job fails unless the log carries
+  `host-shape: verified`. The root must be the prefix and not the package
+  directory — every assertion's `file` already starts with
+  `node_modules/@deepseek-ai/`, and npm hoists the sibling packages to
+  `<prefix>/node_modules/@deepseek-ai/`. The pin matters too: a fence that
+  follows `@latest` reddens the day upstream publishes whether or not anything
+  drifted. A second, advisory job runs the same fence against `@alpha` with
+  `continue-on-error`, so channel movement is visible without blocking.
+
+- **A string fence cannot see a behavioural drift, and two of them were
+  measured.** Deleting the two `notifier.markDirty()` calls inside the host's
+  own `loadOlder()` — leaving every asserted string byte-identical — makes the
+  window revision stop moving, so the plugin counts each successful page as a
+  stall and the jump fails for the user. All 23 assertions stayed green. The
+  same held for an early `return` inserted after the line one assertion pins.
+
+- **H21 was a tautology** and is removed rather than downgraded.
+  `"sessionId: SessionId"` matches 43 times in the runner bundle, so it could
+  not fail for any slot change while still counting toward a "23 assertions
+  verified" claim. H23, the anchored version that isolates the one slot entry
+  that matters, stays and is strictly stronger; an assertion now fails if H21
+  returns.
+
+- **The frozen-clock gate the README names was not in CI.** The release gate —
+  `node --import ./test/freeze-clock.mjs --test`, the evidence that the jump
+  budget counts pages, stalls and frames instead of wall time — now runs in the
+  check job.
+
+### Added
+
+- **`test/host-contract.test.mjs`** drives the real `runJump` / `jumpDeps` /
+  `executeJump` against a behavioural host double that answers only through the
+  public session face, so the two blind spots above have regression tests: a
+  host whose `loadOlder()` does not advance the revision must report `stalled`,
+  and a host that no-ops under its own `loadingOlder` guard must be waited for.
+  Its one row that reads a real installation resolves its root from
+  `DSH_ANNOTATE_HOST_ROOT` the way the shape fence does — a host that is merely
+  missing is a failure there, and only an explicit `absent` skips.
+  `test/host-contract.mutations.sh` is the counter-proof: M1 reproduces the
+  invisible mutation (drive red, string fence green), and M4 closes a real
+  coverage hole that the first pass of this work explained away as a weak
+  mutant — the branch is reachable at `stalls === 2` and the mutant changes the
+  outcome, so it is caught.
+
+  The browser half republishes the host-face declarations as `ctx.hostFace` so
+  the drive can reach the shipping functions rather than a copy. It is a local,
+  non-exported object and the jump core is byte-identical (79 insertions, 0
+  deletions). Known trade-off: it is written on the unconditional `apply()` path
+  and never cleaned up, on a context the host wraps in a `get`-only proxy that
+  accepts the assignment on this plugin's static bundle path. No other static
+  plugin on this machine assigns to `ctx.<name>`, so it is a new pattern here
+  rather than an established one.
+
 ## [0.10.1] - 2026-10-09
 
 ### Fixed
@@ -168,6 +317,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The repository suite is 150/150 locally (host shape fence included, DSH host
   present), stable over repeated runs.
 
+[0.10.5]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.4...v0.10.5
+[0.10.4]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.3...v0.10.4
+[0.10.3]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.2...v0.10.3
+[0.10.2]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.0...v0.10.1
 
 ## [0.10.0] - 2026-10-09

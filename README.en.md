@@ -65,7 +65,7 @@ Every extension point used is a documented DSH service or slot contract (`agent/
 | Item | Detail |
 |---|---|
 | Storage | `$DSH_HOME/annotations/annotations.json`, mode `0600`; written to a temp file then `rename`d, concurrent writes serialized; before backfilling numbers it writes `annotations.json.migrate-0.9.0.bak` beside the store (mode `0600`, an existing copy is kept and no second one is created) |
-| Capacity | At most 400 per session; beyond that the oldest delivered annotations are cleaned first and pending ones are never dropped |
+| Capacity | At most 400 per session; beyond that the oldest delivered annotations are cleaned first and **pending ones are never dropped**; when there are not enough delivered annotations to clean, a new one is **refused** and you see “save failed” on the spot (HTTP 400, with the server message naming the full session) — **nothing that already exists is lost** |
 | Length | Quote 2000 chars, note 4000 chars (truncated); request body capped at 512 KiB |
 | API auth | Loopback `Host` plus a one-time token minted per boot and injected only into pages this process serves |
 | Network | **No outbound requests at all** — it writes local files and serves the local browser only |
