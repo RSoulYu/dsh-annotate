@@ -25,18 +25,25 @@
  *      `contextMessage`). It is still a logged, model-visible message.
  *
  * Delivery is deliberately "once per message", and it is confirmed rather than
- * assumed: the pre-step listener injects the block and remembers the receipt
- * (the block's own header line) plus the step it went into, and the annotations
- * are marked delivered only once the session log publishes the `user/message`
- * that carries that receipt. Returning `enter` does not guarantee the step
- * reaches the log — the loop checks its abort signal, and runs `prepareRequest`,
- * before it appends — so a block that never landed must not be reported as
- * delivered. When the step or turn ends without the receipt, the annotations
- * stay pending and ride the next message, which is exactly the retry the user
- * expects after a stop or a failed request.
+ * assumed: the pre-step listener injects the block and remembers which batch of
+ * annotations went into which step, and those annotations are marked delivered
+ * only once the session log publishes the `user/message` that proves it. The
+ * proof is the batch token on the block's own last line, together with the
+ * plugin's own `source.kind` — never the block's header line, which two
+ * different batches can print identically and which a user can paste. Returning
+ * `enter` does not guarantee the step reaches the log — the loop checks its
+ * abort signal, and runs `prepareRequest`, before it appends — so a block that
+ * never landed must not be reported as delivered. When the step or turn ends
+ * without the proof, the annotations stay pending and ride the next message,
+ * which is exactly the retry the user expects after a stop or a failed request.
  *
- * While one receipt is unconfirmed the session injects nothing further: the
- * block may already be in the log, and a second injection would duplicate it.
+ * The same standard applies a boot later: {@link reconcile} reads the session's
+ * own log and accepts only a `user/message` carrying the same token under the
+ * plugin's `source.kind`, which is how a block that reached the log before the
+ * process exited is not sent a second time.
+ *
+ * While one batch is unconfirmed the session injects nothing further: the block
+ * may already be in the log, and a second injection would duplicate it.
  *
  * "Which step carries the user's message" is decided by `source.kind`, never by
  * `role` and never by `step === 1`. The loop claims a batch of inbox messages
@@ -90,8 +97,17 @@ export const inject = ['tools']
  *
  * Revision 10: loading the store now backfills the numbers the records written
  * before 0.8.0 never persisted, and leaves a copy of the store behind first.
+ *
+ * Revision 11: every block carries a per-batch identity and the next boot
+ * reconciles an unconfirmed delivery against the session log, closing the
+ * duplicate window of README §7.
+ *
+ * Revision 12: confirmation is one standard again — the batch token under the
+ * plugin's own `source.kind` — on both the in-process and the cold-log path.
+ * The older header-substring leg, which could admit a message the plugin never
+ * sent, is gone.
  */
-const REVISION = 10
+const REVISION = 12
 
 const ROUTE_PATH = '/plugins/dsh-annotate/api'
 /**
@@ -118,6 +134,53 @@ const MAX_QUOTE = 2000
 const MAX_NOTE = 4000
 const MAX_PER_SESSION = 400
 const STATUSES = new Set(['pending', 'delivered'])
+/**
+ * The marker line of every block: the batch's own identity, and the only part
+ * of the text that decides whether a `user/message` is this batch's block.
+ *
+ * It is deliberately not the only required condition — a message must ALSO
+ * carry the plugin's own `source.kind`, which is what excludes a user pasting
+ * the block or a model repeating it. The two are independent, and both are
+ * required; neither is sufficient alone.
+ *
+ * The header line cannot serve as identity. It reads
+ * `—— 批注（共 N 处，编号 …）——` and is decided entirely by how many
+ * annotations the batch holds and which numbers they carry — it says nothing
+ * about content, so it is not unique: every session's first batch is
+ * `共 1 处，编号 1`, a freed maximum number is deliberately reused (README §6),
+ * and the string sits in 98 places across the sessions on this machine
+ * (tool results, assistant replies, and text the user typed themselves). A
+ * receipt that another batch can produce is not a receipt.
+ *
+ * So the marker carries a per-batch `randomUUID`, and the round trip is exact:
+ * {@link renderBlock} writes the line and the ids it belongs to, {@link tokenOf}
+ * and {@link idsOf} read them back out of the text — by scanning for the marker
+ * line, so that text after it does not defeat recognition — and every judgement
+ * goes through equality on the token, never a substring of the header. A UUID
+ * is not something a quote, a note, a model reply or a user's own paste produces
+ * by accident, and two boots cannot mint the same one.
+ */
+const BATCH_MARKER = '批次'
+
+/**
+ * The vocabulary of `event.type` that carries the block. The plugin only ever
+ * puts it on a `user/message` (`blockMessage`), so anything else in the log is
+ * text that merely looks like a block.
+ */
+const BLOCK_EVENT_TYPE = 'user/message'
+/**
+ * A UUID, and how it is found.
+ *
+ * Anchored and case-insensitive rather than global: the token is always the
+ * first thing on the marker line, so an anchored match is the whole search — and
+ * a non-global pattern carries no `lastIndex` between calls, which a `g` flag
+ * would (and a shared pattern whose `lastIndex` drifted would start missing
+ * tokens that are plainly there). `match` and `test` both report the match, so
+ * one literal serves {@link canonicalToken} and {@link asToken} alike.
+ */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+/** A UUID anywhere in a line, for the marker line the block writes. */
+const UUID_ANYWHERE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
 
 /* ------------------------------------------------------------------ paths */
 
@@ -171,6 +234,28 @@ function asNumber(value) {
 }
 
 /**
+ * Keep a batch token only when it is exactly one canonical UUID.
+ *
+ * The same acceptance rule shape as {@link asOccurrence} and {@link asNumber}:
+ * the field is optional (a pre-0.10.3 record has none) and the stored file is
+ * not trusted, so anything else — a number, a truncated id, a sentence, a
+ * value a hand-edited file invented — becomes `undefined` rather than a token
+ * that could match a block by accident. `undefined` is what every caller does
+ * anyway when it has no token: the field is left out.
+ *
+ * @param value candidate token.
+ */
+function asToken(value) {
+  if (typeof value !== 'string') return undefined
+  // The anchored pattern, not a round trip through `canonicalToken`: the two
+  // disagree on exactly the strings that matter — a sentence containing a UUID
+  // is a valid TOKEN when read back out of a block (the token is the first UUID
+  // on the line) but is not a valid STORED value, and accepting one there would
+  // let a stray string stand in for a batch.
+  return UUID.test(value.trim()) ? value.trim().toLowerCase() : undefined
+}
+
+/**
  * Resolve the Session id from an agent handle. The event contract exposes
  * `agent.id`, but the live Agent also carries `agent.session.id`; prefer
  * whichever looks like a session id so a contract change degrades to the
@@ -208,6 +293,13 @@ function normalizeRecord(raw) {
     origin: raw.origin === 'user' ? 'user' : 'assistant',
     occurrence: asOccurrence(raw.occurrence),
     number: asNumber(raw.number),
+    // 0.10.3. `batchId` is the token of the batch this record is currently
+    // riding; `deliveredBatch` is the token it was delivered under. Both are
+    // optional and both are `undefined` on a record written before they
+    // existed, which is what keeps a 0.10.3 store readable by 0.10.2 and a
+    // 0.10.2 store readable here (they are simply absent, never invented).
+    batchId: asToken(raw.batchId),
+    deliveredBatch: asToken(raw.deliveredBatch),
   }
 }
 
@@ -402,6 +494,41 @@ class AnnotationStore {
       .sort((a, b) => b.createdAt - a.createdAt)
   }
 
+  /**
+   * The batch tokens this session has already settled.
+   *
+   * This is what closes the window the restart reconciliation exists for. The
+   * reconciliation reads the session log to find out whether a batch reached
+   * it, and the log outlives the process — which is also exactly the problem:
+   * a block from an earlier boot is still sitting in the log, and without
+   * something that remembers "that batch is already accounted for", the next
+   * boot would see it and call the next batch delivered too. Every delivered
+   * record records the token it rode, and {@link reconcile} refuses to accept a
+   * token a delivered record already claims.
+   *
+   * The token is read from `deliveredBatch` whatever the record's CURRENT
+   * status is, and that is deliberate: a re-queued record is `pending` again
+   * but keeps its `deliveredBatch` — its first block is still in the log, and
+   * the whole point of the ledger is to stop that block from confirming the
+   * second attempt. Keying on `status === 'delivered'` would let exactly the
+   * record that was re-queued be confirmed by its own old delivery.
+   *
+   * It is a lookup, not the truth: the log is still the only thing that makes a
+   * block delivered. This only says "this token has been settled before", which
+   * is a question about the store's own history.
+   *
+   * @param {string} sessionId
+   * @returns {Set<string>}
+   */
+  ledger(sessionId) {
+    const settled = new Set()
+    for (const record of this.state.annotations) {
+      if (record.sessionId !== sessionId) continue
+      if (record.deliveredBatch !== undefined) settled.add(record.deliveredBatch)
+    }
+    return settled
+  }
+
   pending(sessionId) {
     return this.list(sessionId)
       .filter((item) => item.status === 'pending')
@@ -473,29 +600,85 @@ class AnnotationStore {
   }
 
   /**
-   * Put one record back in the delivery queue.
+   * Put one batch back in the delivery queue: every record of `ids` becomes
+   * pending under a NEW token, in one write.
    *
-   * Only the persisted state changes: the record returns to `pending` and the
-   * delivery receipt (`deliveredAt`/`deliveredTurn`) is dropped, so the next step
-   * that carries input attributed to the user picks it up again like any other
-   * pending annotation — a step that carries none never takes it. This
+   * Only the persisted state changes: those records return to `pending` and
+   * their delivery stamp (`deliveredAt`/`deliveredTurn`) is dropped, so the next
+   * step that carries input attributed to the user picks them up again like any
+   * other pending annotation — a step that carries none never takes them. This
    * deliberately does not inject anything itself: injection is the pre-step
    * listener's job, and it is confirmed off the session log.
    *
-   * Idempotent: a record that is already pending comes back pending (with a
-   * refreshed `updatedAt`).
+   * It is idempotent for a record that is already pending (it comes back
+   * pending, with a refreshed `updatedAt` and the new token), and it is not a
+   * per-record loop: a re-queued annotation rides a batch that has not been
+   * sent before — that is the only way the restart reconciliation can tell the
+   * second attempt from the first, since the FIRST attempt's block is still
+   * sitting in the log and still carries the first token. Reusing that token
+   * would make the next boot's reconciliation read the stale block as proof of
+   * the new batch, which is precisely the misjudgement it must never make. One
+   * write for the whole batch, too, so a process exiting halfway cannot leave
+   * half of it re-queued.
+   *
+   * @param {string[]} ids records of one session to re-queue.
+   * @param {string} token the new batch's canonical token.
+   * @returns the number of records changed.
    */
-  async redeliver(id) {
-    const record = this.state.annotations.find((item) => item.id === id)
-    if (record === undefined) return undefined
-    record.status = 'pending'
-    record.deliveredAt = undefined
-    record.deliveredTurn = undefined
-    record.updatedAt = Date.now()
-    await this.flush()
-    return record
+  async requeue(ids, token) {
+    const wanted = new Set(ids)
+    const batch = asToken(token)
+    let changed = 0
+    for (const record of this.state.annotations) {
+      if (!wanted.has(record.id)) continue
+      record.status = 'pending'
+      record.deliveredAt = undefined
+      record.deliveredTurn = undefined
+      // `deliveredBatch` is deliberately NOT cleared. It is the ledger: "this
+      // token has already been settled", which is still true — the block that
+      // carried it is in the log. Clearing it would let a later reconciliation
+      // accept that same old block a second time.
+      record.batchId = batch
+      record.updatedAt = Date.now()
+      changed += 1
+    }
+    if (changed > 0) await this.flush()
+    return changed
   }
 
+  /**
+   * Stamp the batch token onto the records that are about to be sent.
+   *
+   * This is a WRITE, and it has to be. The token is the only thing that lets a
+   * later boot find out whether this batch reached the log: the block carries
+   * it, so the log carries it — but a boot can only ask the log about a token
+   * the STORE still remembers. If the stamp lived only in memory, the crash
+   * this whole path exists for (block appended, process gone, store still
+   * `pending`) would also take the token with it, and the next boot would have
+   * nothing to look for.
+   *
+   * Persisting it does not mark anything delivered and cannot lose an
+   * annotation: the records stay `pending`, so the worst a stamp can do is leave
+   * a token on a record whose block never landed — a token no log will ever
+   * name, which the next boot's reconciliation finds nothing for and which the
+   * next delivery overwrites.
+   *
+   * @param {string[]} ids records of one batch.
+   * @param {string} token that batch's canonical token.
+   */
+  async stampBatch(ids, token) {
+    const wanted = new Set(ids)
+    const batch = asToken(token)
+    if (batch === undefined) return
+    let changed = false
+    for (const record of this.state.annotations) {
+      if (!wanted.has(record.id) || record.batchId === batch) continue
+      record.batchId = batch
+      record.updatedAt = Date.now()
+      changed = true
+    }
+    if (changed) await this.flush()
+  }
   async clearDelivered(sessionId) {
     const before = this.state.annotations.length
     this.state.annotations = this.state.annotations.filter(
@@ -506,15 +689,32 @@ class AnnotationStore {
     return removed
   }
 
-  /** Mark records delivered; returns the records that changed. */
-  async markDelivered(ids, turn) {
+  /**
+   * Mark records delivered and record the batch they were delivered under.
+   *
+   * Idempotent: a record already delivered is skipped, so a second caller
+   * cannot move its stamp. Returns the records that actually changed.
+   *
+   * The batch token is written only when the caller has one to give, and only
+   * the `annotation` tool's `resolve` has none — it answers annotations the
+   * model has dealt with rather than delivering a block, so there is no batch
+   * to record and the field is left exactly as absent as it is on a pre-0.10.3
+   * record. No token is ever invented.
+   *
+   * @param {string[]} ids records to mark.
+   * @param {number} [turn] the turn a block went into, when there was one.
+   * @param {{batch?: string}} [options] the batch token, when there was one.
+   */
+  async markDelivered(ids, turn, options = {}) {
     const wanted = new Set(ids)
+    const batch = asToken(options.batch)
     const changed = []
     for (const record of this.state.annotations) {
       if (!wanted.has(record.id) || record.status === 'delivered') continue
       record.status = 'delivered'
       record.deliveredAt = Date.now()
       record.deliveredTurn = Number.isFinite(turn) ? turn : undefined
+      record.deliveredBatch = batch
       record.updatedAt = record.deliveredAt
       changed.push(record)
     }
@@ -585,10 +785,17 @@ function numbering(records) {
  * does that. It still ends with a newline so the instruction line is a
  * paragraph of its own.
  *
+ * The last line is the batch marker (see {@link BATCH_MARKER}). It goes at the
+ * END on purpose: the header line is what the panel, the tests and the reader
+ * know, and a marker at the end leaves it exactly as it was. What the line
+ * costs — a UUID and one line per block — buys the only thing that can tell two
+ * batches apart.
+ *
  * @param records pending records in creation order.
  * @param {Map<string, number>} numbers stable per-session numbers.
+ * @param {string} token the batch's canonical token.
  */
-function renderBlock(records, numbers) {
+function renderBlock(records, numbers, token) {
   const lines = []
   const labels = records.map((record) => numbers.get(record.id) ?? 0)
   lines.push(`—— 批注（共 ${records.length} 处，编号 ${labels.join('、')}）——`)
@@ -605,37 +812,100 @@ function renderBlock(records, numbers) {
       '不要复述原文，先直接回答问题，需要时再引用被批注的句子。',
   )
   lines.push('')
+  // The token comes FIRST because {@link canonicalToken} reads the first UUID
+  // on the line, and the block does not get to choose what a quote contains.
+  // The ids after it are what make the block specific to these records rather
+  // than merely to this batch.
+  lines.push(`${BATCH_MARKER} ${token} · ${records.map((record) => record.id).join(',')}`)
+  lines.push('')
   return lines.join('\n')
 }
 
+function canonicalToken(text) {
+  const found = String(text).match(UUID_ANYWHERE)
+  return found === null ? '' : found[0].toLowerCase()
+}
+
 /**
- * The delivery receipt of one rendered block: its header line.
+ * The batch token of a rendered block, read back out of its own text.
  *
- * This is what the store waits for in the session log before calling an
- * annotation delivered. Nothing is added to the message for bookkeeping — the
- * receipt is text the model already reads, so the log stays clean and a
- * receipt cannot be forged by the plugin itself.
+ * The marker is found by scanning UP for the last non-empty line that STARTS
+ * WITH {@link BATCH_MARKER}, not by assuming the marker is the last non-empty
+ * line of the text. The difference matters in the one direction that would
+ * otherwise go unnoticed: a log event is not required to end where the block
+ * ends. A host that appends anything after it — its own annotation, a wrapper,
+ * a note about the message — used to make the whole token comparison fail, so a
+ * block that WAS in the log read as absent and the annotation was sent a second
+ * time. Requiring the marker's own line instead keeps the recognition, and
+ * scanning upward (rather than forward) keeps the answer the same when the
+ * surrounding text happens to contain a line that looks like a marker.
  *
- * @param block output of {@link renderBlock}.
+ * The first UUID on that line is the token; the ids that follow it are read by
+ * {@link idsOf} from the same line.
+ *
+ * @param {string} text the rendered block, possibly embedded in more text.
+ * @returns the canonical token, or `''` when no marker line is there.
  */
-function receiptOf(block) {
-  for (const line of String(block).split('\n')) {
-    if (line.trim().length > 0) return line
+function tokenOf(text) {
+  const lines = String(text).split('\n')
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim()
+    if (line.length === 0 || !line.startsWith(BATCH_MARKER)) continue
+    return canonicalToken(line)
   }
   return ''
 }
 
 /**
- * Whether one `user/message` event is the message that carries this receipt.
- * @param event the appended session event.
- * @param receipt receipt of the injected block.
+ * The annotation ids one rendered block carried, in block order.
+ *
+ * The reason a batch can be identified beyond its token: the ids say WHICH
+ * records the block was built from, so a block that carried a different set is
+ * a different block.
+ *
+ * Only the last non-empty line is read, so nothing in the surrounding prose can
+ * be mistaken for the marker.
+ *
+ * @param {string} text the rendered block.
+ * @returns {string[]} ids, in block order; empty when there is no marker.
  */
-function eventCarriesReceipt(event, receipt) {
-  if (receipt.length === 0) return false
-  const content = event?.data?.content
-  if (!Array.isArray(content)) return false
-  return content.some(
-    (part) => part?.type === 'text' && typeof part.text === 'string' && part.text.includes(receipt),
+function idsOf(text) {
+  const lines = String(text).split('\n')
+  // The SAME line {@link tokenOf} reads, found the same way: the last non-empty
+  // line that starts with the marker. Taking "the last non-empty line" here
+  // would be a second, independent way for the pair to lose track of a block
+  // that plainly carries a marker — the token would be found and the ids would
+  // not, and `eventIsBlockOf` requires both. The two functions must agree about
+  // which line is the marker's.
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim()
+    if (line.length === 0 || !line.startsWith(BATCH_MARKER)) continue
+    // Everything after the `·` is the id list; the token itself is the first
+    // UUID on the same line, which `tokenOf` reads.
+    const at = line.indexOf('·')
+    if (at === -1) return []
+    return line
+      .slice(at + 1)
+      .split(',')
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0)
+  }
+  return []
+}
+
+/**
+ * Whether the block DEFINES this token — the forward direction, used to decide
+ * whether a message about to be sent is the injected block itself.
+ *
+ * Deliberately not the reverse test: a message that merely CONTAINS the token
+ * (a user pasting the block, the model repeating it) must not be identity.
+ * @param {any} message the injected message.
+ * @param {string} token canonical batch token.
+ */
+function messageDefinesToken(message, token) {
+  if (token.length === 0 || !Array.isArray(message?.content)) return false
+  return message.content.some(
+    (part) => part?.type === 'text' && typeof part.text === 'string' && tokenOf(part.text) === token,
   )
 }
 
@@ -647,12 +917,14 @@ function eventCarriesReceipt(event, receipt) {
  * keeps the row out of the user's own bubble.
  *
  * @param block output of {@link renderBlock}.
+ * @param token the batch's canonical token, carried on the message so the
+ *   caller knows what to look for without parsing the text again.
  */
-function blockMessage(block) {
+function blockMessage(block, token) {
   return {
     id: randomUUID(),
     role: 'user',
-    source: { kind: BLOCK_SOURCE_KIND },
+    source: { kind: BLOCK_SOURCE_KIND, batch: token },
     content: [{ type: 'text', text: block }],
   }
 }
@@ -679,7 +951,7 @@ function blockMessage(block) {
  *
  * @returns the replacement message list, or undefined when nothing applies.
  */
-function injectIntoMessages(messages, block) {
+function injectIntoMessages(messages, block, token) {
   if (!Array.isArray(messages) || messages.length === 0) return undefined
   let index = -1
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -691,8 +963,158 @@ function injectIntoMessages(messages, block) {
   }
   if (index === -1) return undefined
   const out = messages.slice()
-  out.splice(index + 1, 0, blockMessage(block))
+  out.splice(index + 1, 0, blockMessage(block, token))
   return out
+}
+
+/* ------------------------------------------------- the restart reconciliation */
+
+/**
+ * Whether one raw log event is the block of ONE KNOWN batch.
+ *
+ * The caller already knows which batch it is looking for — it read the token
+ * out of the record that was about to be sent — and this function answers a yes
+ * or no question about one event. There is deliberately no "scan for any block"
+ * variant: the only question worth asking the log is "is THIS batch in it",
+ * because that is the only question whose answer is allowed to change a record.
+ *
+ * Four fences, all required, and the token comparison is exact equality against
+ * the block's own last line rather than a substring search:
+ *
+ *   1. the event must be the type the plugin injects (`user/message`);
+ *   2. `source.kind` must be the plugin's own (`dsh-annotate`), so a model
+ *      reply, a tool result or the user pasting a block is never a delivery;
+ *   3. the text must END with this token — a message that merely quotes a block
+ *      (the user pasting the previous one) has the text but not the ending, and
+ *      a block built before 0.10.3 has no token at all;
+ *   4. the text must name the records it carried, and every one of `ids` must
+ *      be among them.
+ *
+ * The last fence is what makes the answer specific to the annotation rather
+ * than to the batch. It matters for the case the whole reconciliation exists
+ * for: a record re-queued for a second attempt rides a NEW token precisely
+ * because its first block is still in the log, so the old block must not match
+ * the new token (fence 3) — but even the same token cannot be accepted for a
+ * batch whose membership changed, because that would be a different block
+ * answering a question about this one.
+ *
+ * @param event one raw event of a session log.
+ * @param {string} token the canonical token of the batch being asked about.
+ * @param {string[]} ids the annotation ids that batch would carry.
+ * @returns whether this event is exactly that block.
+ */
+function eventIsBlockOf(event, token, ids) {
+  if (token.length === 0 || ids.length === 0) return false
+  if (event?.type !== BLOCK_EVENT_TYPE) return false
+  if (event?.data?.source?.kind !== BLOCK_SOURCE_KIND) return false
+  const content = event?.data?.content
+  if (!Array.isArray(content)) return false
+  for (const part of content) {
+    if (part?.type !== 'text' || typeof part.text !== 'string') continue
+    if (tokenOf(part.text) !== token) continue
+    const carried = idsOf(part.text)
+    if (carried.length !== ids.length) return false
+    const named = new Set(carried)
+    for (const id of ids) if (!named.has(id)) return false
+    return true
+  }
+  return false
+}
+
+/**
+ * Ask the log whether one pending batch of one session already reached it, and
+ * mark it delivered when the answer is yes.
+ *
+ * The duplicate-delivery window is: the block reached `session.log`, the
+ * process exited before the store was written. `inFlight` is memory, so the
+ * next boot is amnesiac, the records still read `pending`, and the block is
+ * sent a second time. The record carries the batch token it LAST rode
+ * ({@link AnnotationStore.requeue} and the pre-step stamp are what put it
+ * there), and the log — which outlives the process and is already the thing
+ * that decides a delivery — is where the answer is.
+ *
+ * Two properties are load-bearing, and both are about NOT writing:
+ *
+ *   - **It only ever moves pending → delivered.** A record whose status is not
+ *     `pending` is left alone wherever the caller found it, so this can never
+ *     undo what the live path did.
+ *   - **A "no" changes nothing at all.** Not finding the block is not evidence
+ *     that it was never sent: the log may be unreadable, the block may have
+ *     been compacted away, the session may not be persisted yet, the host may
+ *     have no query service. Marking a record delivered on any of those would
+ *     silently swallow the user's annotation, which is strictly worse than
+ *     sending it twice. Every failure path here returns without a write.
+ *
+ * The ledger is what keeps the answer specific. A token that some delivered
+ * record already claims has been settled — and the block carrying it is still
+ * in the log, which is exactly the trap: without the gate, the next boot's
+ * reconciliation would read that same old block as proof of the NEXT batch. A
+ * batch is only ever accepted when its token is neither claimed by a delivered
+ * record nor named by a block the log already holds of a batch that is.
+ *
+ * @param {any} query the `sessionQuery` service, or undefined when this host
+ *   has none (a TUI profile, an older host): then nothing is reconciled.
+ * @param {AnnotationStore} store a LOADED store.
+ * @param {string} sessionId the session about to receive a block.
+ * @returns the number of annotations marked delivered.
+ */
+export async function reconcile(query, store, sessionId) {
+  try {
+    if (query === null || typeof query !== 'object' || typeof query.readSession !== 'function') return 0
+    if (sessionId.length === 0) return 0
+    // Nothing to reconcile is the common case and it must not pay for a log
+    // read: a session with no pending annotation has no delivery to confirm.
+    if (store.pending(sessionId).length === 0) return 0
+
+    // The read is the expensive part and it happens once, however many batches
+    // the session has pending (a re-queued one and a fresh one, say); the
+    // questions against it are free.
+    const snapshot = await query.readSession(sessionId)
+    const log = Array.isArray(snapshot?.events) ? snapshot.events : []
+    // A fork inherits its parent's events. A block inside that prefix is the
+    // PARENT's delivery — this session's own batch tokens are not in it — so it
+    // is skipped rather than scanned.
+    const from = Number.isInteger(snapshot?.inheritedEventCount) && snapshot.inheritedEventCount > 0
+      ? snapshot.inheritedEventCount
+      : 0
+    const own = log.slice(from)
+
+    // One pass over the SESSION's records, not over the pending ones: the
+    // question is not "which pending records share a token" but "is the whole
+    // batch of this token pending", and a token whose batch is half-delivered
+    // (the live path got part of it before the process died) has no answer this
+    // path can give — it is left exactly as it is.
+    const batches = new Map()
+    for (const record of store.list(sessionId)) {
+      const token = asToken(record.batchId)
+      if (token === undefined) continue
+      const seen = batches.get(token) ?? { all: true, ids: [] }
+      seen.ids.push(record.id)
+      if (record.status !== 'pending') seen.all = false
+      batches.set(token, seen)
+    }
+
+    const claimed = store.ledger(sessionId)
+    let settled = 0
+    for (const [token, batch] of batches) {
+      // The ledger gate. A token a delivered record already claims has been
+      // settled — and its block is still in the log, which is exactly why this
+      // gate exists: without it, the next boot's reconciliation would read that
+      // same old block as proof of the NEXT batch.
+      if (!batch.all || claimed.has(token)) continue
+      if (!own.some((event) => eventIsBlockOf(event, token, batch.ids))) continue
+      claimed.add(token)
+      const changed = await store.markDelivered(batch.ids, undefined, { batch: token })
+      settled += changed.length
+    }
+    return settled
+  } catch (error) {
+    // Nothing is marked on a failure, and an unreadable log is not worth
+    // failing a turn over: the annotations simply stay pending and ride the
+    // next message, which is the behaviour 0.10.2 already had.
+    store.logger?.warn?.('dsh-annotate: could not reconcile the previous boot\'s deliveries: %o', error)
+    return 0
+  }
 }
 
 /* -------------------------------------------------------------- http plumbing */
@@ -779,11 +1201,43 @@ export function apply(ctx) {
   const token = randomUUID()
   let tokenPublished = false
   /**
-   * Delivery receipts still waiting for the log, per session: which annotation
-   * ids went into which step, and the header line that proves it landed.
-   * @type {Map<string, { ids: string[], receipt: string, turn: number, step: number }>}
+   * Deliveries still waiting for the log to prove them, per session: the rendered
+   * block that went into which step, its header line, and the batch token that
+   * is the only thing that proves it.
+   * @type {Map<string, { ids: string[], block: string, batch: string, turn: number, step: number }>}
    */
   const inFlight = new Map()
+
+  /**
+   * The one thing the restart reconciliation needs from the store's logger, so
+   * the store can report a failure itself. Passed as a getter because both
+   * halves read the same object the plugin was handed.
+   */
+  store.logger = logger
+
+  /**
+   * Read a session's complete raw log, or `undefined` when this host cannot.
+   *
+   * `sessionQuery` is a public cordis service of the host (the same kind of
+   * collaborator as `tools`, `logger` and `webServer`), so it is reached
+   * through `ctx.get` and never through an `import`: the host half stays
+   * builtin-only so a workspace-installed bundle keeps loading. A host that
+   * does not provide it — a TUI profile, an older build — simply has no
+   * reconciliation, and {@link reconcile} returns without writing anything.
+   *
+   * Read through `ctx.get` rather than `ctx.inject(...)` on purpose: injection
+   * would make the service a hard dependency of this plugin row, and a host
+   * without it would refuse to load the plugin at all instead of loading it
+   * without the one ability it cannot provide.
+   */
+  function sessionQuery() {
+    try {
+      const value = ctx.get?.('sessionQuery') ?? ctx.reflect?.get?.('sessionQuery')
+      return typeof value?.readSession === 'function' ? value : undefined
+    } catch {
+      return undefined
+    }
+  }
 
   // Hand the token to the served page. `index-inject` runs while the boot HTML
   // is rendered, which always precedes the browser half that reads it, so the
@@ -863,7 +1317,7 @@ export function apply(ctx) {
     //
     // This sits before `store.load()` on purpose: a step that carries no
     // user-attributed input must not pay for a store read (or, worse, leave a
-    // receipt), and the annotation must stay pending for the user's next message.
+    // proof), and the annotation must stay pending for the user's next message.
     const claimed = payload?.messages
     if (!Array.isArray(claimed) || !Array.isArray(decision.messages)) {
       // A broken payload contract is not "no user input": say so instead of
@@ -874,15 +1328,32 @@ export function apply(ctx) {
     if (!claimed.some((message) => message?.source?.kind === 'user')) return decision
     try {
       await store.load()
-      // One receipt at a time. A live one means the previous block may already
+      // One batch at a time. A live one means the previous block may already
       // be in the log, and injecting it again would duplicate it in the
       // transcript; the step/end below clears it when it demonstrably did not
       // land.
       if (inFlight.has(sessionId)) return decision
+      // The previous boot may have died between "the block reached the log" and
+      // "the store says delivered" (`inFlight` is memory; a restart is amnesia).
+      // This asks the log before deciding to send anything again — see
+      // {@link reconcile} for why it only ever moves pending → delivered.
+      await reconcile(sessionQuery(), store, sessionId)
       const pending = store.pending(sessionId)
       if (pending.length === 0) return decision
-      const block = renderBlock(pending, numbering(store.list(sessionId)))
-      const messages = injectIntoMessages(decision.messages, block)
+      // A fresh token per block. It is what makes THIS block unmistakable in the
+      // log: the header line is decided by the numbers alone and two batches can
+      // share it (every session's first batch is `共 1 处，编号 1`), so the token
+      // is the only part of the block a comparison may rest on.
+      const batch = randomUUID()
+      const ids = pending.map((item) => item.id)
+      // The stamp goes on BEFORE the block can reach the log, and it is awaited
+      // because it is a real write: it is the token that a later boot will ask
+      // the log about, so it must be on disk before the block it names can be.
+      // A stamp whose block never lands is harmless — those records stay
+      // pending, and no log will ever name that token.
+      await store.stampBatch(ids, batch)
+      const block = renderBlock(pending, numbering(store.list(sessionId)), batch)
+      const messages = injectIntoMessages(decision.messages, block, batch)
       if (messages === undefined) {
         // The claimed batch had user-attributed input but the list this step will
         // send has none to hang the block on. Nothing else may host it, so the
@@ -895,8 +1366,9 @@ export function apply(ctx) {
       // check and `prepareRequest` to get through before this message is
       // appended, and a block the model never received is not delivered.
       inFlight.set(sessionId, {
-        ids: pending.map((item) => item.id),
-        receipt: receiptOf(block),
+        ids,
+        block,
+        batch,
         turn: payload?.turn,
         step: payload?.step,
       })
@@ -907,18 +1379,45 @@ export function apply(ctx) {
     }
   })
 
-  /* ---- delivery receipt: the log is what makes a block delivered ---- */
+  /* ---- delivery proof: the log is what makes a block delivered ---- */
   ctx.on('session/event', (session, event) => {
     const sessionId = asId(session?.id)
     if (sessionId.length === 0) return
     const flight = inFlight.get(sessionId)
     if (flight === undefined) return
     if (event?.type === 'user/message') {
-      if (!eventCarriesReceipt(event, flight.receipt)) return
+      // A block confirms a delivery only when it is THIS plugin's block for
+      // THIS batch. Two independent conditions, and BOTH are required:
+      //
+      //   - the message must carry the plugin's own `source.kind`, which is
+      //     what excludes a message that merely quotes the block — the user
+      //     pasting it, the model repeating it, a tool result echoing it. Those
+      //     have the TEXT but not the source;
+      //   - the message must END its text with this batch's token, which is
+      //     what excludes another batch's block. The header line cannot do this
+      //     job: every session's first batch prints the same
+      //     `—— 批注（共 N 处，编号 …）——`, a freed number is reused, and the
+      //     string appears 98 times across the sessions on this machine — in
+      //     tool results, model replies, and text the user typed themselves.
+      //
+      // This is the same standard the cold-log leg applies in
+      // {@link eventIsBlockOf}, and that is the point: the two must agree. An
+      // OR between them would let the weaker one answer alone, and the weaker
+      // one would be a substring test on the header line — text that two
+      // different batches, and a user's own paste, can both produce. Marking a
+      // record delivered on that would swallow the annotation forever, which is
+      // worse than any duplicate this file prevents.
+      //
+      // There is no "either leg" fallback in either direction. A host payload
+      // missing `content`, `source` or `data` simply fails to confirm, and the
+      // annotation stays pending and rides the next message.
+      const provesBlock =
+        event?.data?.source?.kind === BLOCK_SOURCE_KIND && messageDefinesToken(event.data, flight.batch)
+      if (!provesBlock) return
       inFlight.delete(sessionId)
       // `append` publishes this event synchronously, so the store is already
       // loaded on this path; the fallback covers a listener attached earlier.
-      const mark = () => store.markDelivered(flight.ids, flight.turn)
+      const mark = () => store.markDelivered(flight.ids, flight.turn, { batch: flight.batch })
       const settled = store.loaded ? mark() : store.load().then(mark)
       // Returning the promise does not hold the append up — the event is
       // already in the log, and DSH only contains observer rejections — but it
@@ -928,8 +1427,8 @@ export function apply(ctx) {
       })
     }
     // The step (or the whole turn, when the abort lands before the step even
-    // started) is over and the receipt was never seen: the message was not
-    // appended, so those annotations are still unsent. Drop the receipt and let
+    // started) is over and the proof was never seen: the message was not
+    // appended, so those annotations are still unsent. Drop the flight and let
     // the next message carry them.
     if (event?.type === 'step/end' && event.data?.turn === flight.turn && event.data?.step === flight.step) {
       inFlight.delete(sessionId)
@@ -1063,9 +1562,16 @@ async function handleApi(store, body, sessionId) {
     }
     case 'redeliver': {
       const id = asId(body?.id)
-      const record = await store.redeliver(id)
-      if (record === undefined) throw new Error(`unknown annotation: ${id}`)
-      const records = store.list(record.sessionId)
+      const target = store.state.annotations.find((item) => item.id === id)
+      if (target === undefined) throw new Error(`unknown annotation: ${id}`)
+      // Re-queued under a NEW batch token, never the one it was delivered
+      // under: the old block is still in the log, and a re-queue that kept its
+      // token would have the next boot's reconciliation read that block as
+      // proof of this new batch (the ledger refuses a token already settled, so
+      // nothing is lost — but a batch whose token the ledger refuses can never
+      // be reconciled, which is the whole point of minting a fresh one).
+      await store.requeue([id], randomUUID())
+      const records = store.list(target.sessionId)
       const numbers = numbering(records)
       return { annotations: records.map((item) => toClient(item, numbers)) }
     }

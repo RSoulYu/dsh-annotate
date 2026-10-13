@@ -4,6 +4,101 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4] - 2026-10-13
+
+### Fixed
+
+- **A pending annotation could be marked delivered by a message the plugin
+  never sent — losing the annotation for good.** Independent verification
+  (`t3`) reported it, and it reproduces on the shipped code with no mutation at
+  all. The in-process confirmation had two conditions joined by **OR**:
+  a batch-token check, and the older `eventCarriesReceipt`, which is a plain
+  `includes()` of the block's header line. That second leg looks at neither
+  `source.kind` nor the token, so it alone could admit anything whose text
+  contains `—— 批注（共 N 处，编号 …）——`: a plain user message quoting the block,
+  an assistant reply repeating it, a tool result echoing it, or another
+  batch's block carrying the same header under a different token. All four were
+  measured — **the record flipped to `delivered` while the block was never in
+  the log.** The header line cannot tell these apart, by construction: every
+  session's first batch prints the same line (see 0.10.3 above).
+
+  The two legs are now **one standard, and it is the one the cold-log path
+  already used**: a `user/message` under the plugin's own `source.kind` whose
+  text ends on THIS batch's token. `eventCarriesReceipt` and `receiptOf` are
+  gone rather than kept as a fallback — a weaker second opinion that can answer
+  alone is how this went wrong in the first place.
+
+  This had **zero test coverage**: the verifier removed the leg's token gate and
+  all 64 delivery tests stayed green. Four cases now pin it, each asserting the
+  record stays `pending`, alongside the positive control that the real block
+  still confirms — plus mutation `M6/X1` in `test/reconcile.mutations.sh`, which
+  was invisible before and fails two tests now.
+
+- **A block followed by any other text stopped being recognised, so it was sent
+  a second time.** `tokenOf` and `idsOf` assumed the marker line was the last
+  non-empty line of the text. A host that appends anything after the block — its
+  own annotation, a wrapper — made the token unreadable, the block read as
+  absent, and the annotation re-sent. Both now scan UP for the last non-empty
+  line that STARTS WITH `批次`, which is what "the marker line" means
+  independently of what follows it. This direction was conservative (a duplicate,
+  never a loss), and mutation `M7` now covers it.
+
+- Two comments were corrected where the implementation had drifted from what
+  they claimed: the module header still described the header line as the
+  delivery proof, `BATCH_MARKER` still called itself the *only* condition (the
+  `source.kind` fence is equally required), and `markDelivered`'s note mentioned
+  a "hold back to delivered" caller that does not exist.
+
+## [0.10.3] - 2026-10-13
+
+### Fixed
+
+- **The duplicate-delivery window of README §7 is closed: a block that reached
+  the session log is no longer sent a second time after a restart.** The window
+  was `session.log` holding the block while the process died before
+  `markDelivered` wrote the store. `inFlight` is a plain in-process `Map`, so
+  the next boot started amnesiac, the records still read `pending`, and the same
+  block went out again.
+
+  The next boot now asks the **session log**, which outlives the process and is
+  already the thing that decides a delivery. Right before it would send a
+  session's pending annotations — never as a boot-time scan — it reads that
+  session's raw event log through the host's public `sessionQuery` service and
+  marks a batch delivered only when it finds the `user/message` that carries it.
+  A host without that service (a TUI profile, an older build) loads and delivers
+  exactly as 0.10.2 did, just without the reconciliation.
+
+  This needed a real batch identity first, and that is the second half of the
+  fix: `receiptOf` — the block's header line — is `—— 批注（共 N 处，编号 …）——`,
+  decided by the batch size and the annotation numbers alone and therefore not
+  unique. Every session's first batch prints the same line, a freed maximum
+  number is deliberately reused (README §6), and the string appears 98 times
+  across the sessions on the machine this was measured on — in tool results,
+  assistant replies, and text users typed themselves. Reconciling against that
+  line would have converted a duplicate delivery into a **silently swallowed
+  annotation**, which is strictly worse. So each block now ends with
+  `批次 <uuid> · <ids>`, the token is persisted onto the records before the
+  block can reach the log, and every comparison is exact equality on that token
+  (plus the plugin's own `source.kind` and the record list), never a substring
+  match on the header.
+
+  Two further rules keep the inference one-way and safe. A record remembers the
+  batch it was **delivered** under and the reconciliation refuses a token that
+  is already settled — without that, the first attempt's block, still sitting in
+  the log, would confirm the second attempt after a re-queue; re-queues
+  therefore mint a fresh token. And a failed or empty read changes **nothing**:
+  an unreadable log, a missing service, an unpersisted session or a block
+  removed by compaction all leave the records pending. Sending a block twice
+  stays possible in exactly those cases, and that is the deliberate trade — a
+  duplicate is the model reading it again, while a false delivery loses the
+  user's annotation for good.
+
+  Verified by `test/reconcile.test.mjs` (restart, no-restart, the M1/M2/M3/M5/M6
+  misjudgement paths, and the fork-inherited prefix), by
+  `test/real-host-drive.mjs`, which holds the assumptions against the real host
+  and its real logs, and by `test/reconcile.mutations.sh`, whose five mutations
+  each turn the drive red. The `annotation` tool reports revision 11.
+
 ## [0.10.1] - 2026-10-09
 
 ### Fixed
