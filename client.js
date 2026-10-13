@@ -55,6 +55,12 @@ window.__ModuleLoader__.load({
      * `requestAnimationFrame`, then `setTimeout`).
      */
     var runtime = { openTab: null, sessions: null, frameScheduler: null }
+    /**
+     * The test seam, declared early because the host-face object literal is
+     * built above `apply` and `frameSchedule` is declared below it. `apply`
+     * is the only writer and it writes once, with the real frame scheduler.
+     */
+    var testSeam = null
 
     /* ------------------------------------------------------------ i18n */
 
@@ -1021,6 +1027,36 @@ window.__ModuleLoader__.load({
       runJump: runJump,
     }
 
+    /**
+     * The host shape the jump drives, reachable from a test.
+     *
+     * `test/host-contract.test.mjs` needs the REAL `jumpDeps` — the adapter that
+     * turns the host's public session face into runJump's collaborators — to
+     * drive a behavioural host double. A copy would defeat the point, so the
+     * declarations are republished here, in the same split this file already
+     * uses for the pure slice. `frameSchedule` hands the drive real frames, so a
+     * wait can be driven instead of a `tick` collaborator being swapped out.
+     *
+     * FROZEN, and part of the test contract: the ceiling of this list and the
+     * ceiling of the `@pure-anchor-face` block declared just above
+     * `sessionLookup` must stay equal. A new member is an explicit act in both
+     * places, and an extra member that is merely visible silently is what the
+     * pair catches. Nothing here is exported by the package and nothing in the
+     * shipping path reads it: `coreExports` is the published half and stays
+     * untouched.
+     */
+    testSeam = {
+      frameSchedule: null,
+      frameHook: null,
+      bindSession: bindSession,
+      sessionLookup: sessionLookup,
+      sessionSnapshot: sessionSnapshot,
+      windowRevision: windowRevision,
+      jumpStateOf: jumpStateOf,
+      jumpDeps: jumpDeps,
+      executeJump: executeJump,
+    }
+
     /** Ordered text segments of the transcript, skipping this plugin's own UI. */
     function collectSegments() {
       var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null)
@@ -1346,6 +1382,32 @@ window.__ModuleLoader__.load({
         }
       }
     }
+
+    /**
+     * The frozen ceiling of the host-shape test seam.
+     *
+     * The assertions themselves live in `test/host-contract.test.mjs`, next to
+     * the drive they belong to; this is the one half that has to sit in the
+     * shipping comment syntax, the way `sessionLookup` below it is the one
+     * non-pure function the seam has to reach.
+     */
+    /* @pure-anchor-face
+     * FROZEN HOST FACE — the exact set of declarations the browser half grants
+     * the host-shape drive, and the only ones:
+     *   frameSchedule    the frame scheduler, so a drive can await the plugin's own frames
+     *   frameHook        the one place a drive may install its own frame source
+     *   bindSession      the one place a session id is stored, so a drive can bind one
+     *   sessionLookup    the one place `ctx.sessions.binding(id)` is called
+     *   sessionSnapshot  the one place `binding.session` is read
+     *   windowRevision   the one place `binding.eventSource` is read
+     *   jumpStateOf      the three snapshot fields the step table judges
+     *   jumpDeps         the adapter that turns the face into runJump's collaborators
+     *   executeJump      the whole path, path 1 included, so no probe can claim it
+     * The identical list is assigned to `testSeam` above `collectSegments`.
+     * Both halves are asserted equal by the drive, so a face member can only be
+     * added by an explicit act in both places — never by one riding along.
+     * @pure-anchor-face-end
+     */
 
     /**
      * The host's session binding for the session being jumped in, read fresh.
@@ -2740,6 +2802,23 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
+      // Test seam, and an explicitly given one: the suite that drives the real
+      // jump against a behavioural host double has to reach the very functions
+      // that read the host face. Republished here rather than copied into the
+      // test, so a copy cannot drift away from what ships. It is a local
+      // variable, never a package export, and it changes nothing the hook does.
+      testSeam.frameSchedule = function (callback) {
+        // The seam's scheduler is the plugin's own: it goes through the same
+        // `runtime.frameScheduler` / requestAnimationFrame / setTimeout ladder
+        // every jump frame uses, so a drive cannot accidentally wait on a
+        // different clock than the one the shipping path waits on.
+        return frameSchedule(callback)
+      }
+      testSeam.frameHook = function (hook) {
+        runtime.frameScheduler = hook
+      }
+      ctx.hostFace = testSeam
+
       ctx.effect(function () {
         var disposeZh = ctx.locale.register('dsh-annotate', 'zh', ZH)
         var disposeEn = ctx.locale.register('dsh-annotate', 'en', EN)

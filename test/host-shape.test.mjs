@@ -187,13 +187,28 @@ const ASSERTIONS = [
     value: '"data-conversation-scroll": ""',
     why: 'the conversation is one scrollport handed to the transcript',
   },
-  {
-    id: 'H21',
-    file: 'node_modules/@deepseek-ai/dsh-cordis-client-runner/lib/client.js',
-    kind: 'contains',
-    value: '"sessionId: SessionId"',
-    why: "the sidebar.right.pane.tab slot's standard props carry the session identity the jump addresses",
-  },
+  /**
+   * H21 used to sit here and is deliberately gone (hardening round, direction B).
+   *
+   * It was `contains` on `"sessionId: SessionId"` with no anchor, and that
+   * substring occurs 43 times in the runner bundle — every slot's
+   * `standardProps` lists it — so the assertion could not fail while ANY slot
+   * kept the string, including one that has nothing to do with this plugin. It
+   * was measured, not guessed:
+   *
+   *   $ grep -o '"sessionId: SessionId"' \
+   *       node_modules/@deepseek-ai/dsh-cordis-client-runner/lib/client.js | wc -l
+   *   43
+   *
+   * A tautology is worse than a missing assertion: it counts toward a "22
+   * assertions verified" claim while being able to distinguish nothing. H23
+   * below is the honest replacement — the same substring, anchored to the one
+   * entry that matters — and it is strictly stronger than H21 ever was.
+   *
+   * The frozen H1–H22 list is otherwise untouched: no id was renumbered, no
+   * value or count was relaxed. Removing one entry cannot hide a drift that
+   * H23 does not already catch.
+   */
   {
     id: 'H22',
     file: 'node_modules/@deepseek-ai/dsh-client-ui-chat/lib/client.js',
@@ -202,12 +217,13 @@ const ASSERTIONS = [
     why: 'collapsed blocks use the platform hidden=until-found, which keeps text in the DOM',
   },
   /**
-   * H23 is an ADDITION to the frozen list, not an edit of it (ruling 7 / F5):
-   * H21's substring occurs 43 times in the runner bundle, because every slot's
-   * `standardProps` lists it, so H21 alone stays green even if this one slot
-   * loses `sessionId`. H23 pins the assertion to the `sidebar.right.pane.tab`
-   * entry itself: the anchor is that slot's own `key:` line, and the window ends
-   * at the entry's next closing line.
+   * H23 is the survivor of the pair: it is what H21 was trying to say.
+   *
+   * The substring occurs 43 times in the runner bundle — every slot's
+   * `standardProps` lists it — so an unanchored `contains` stays green even if
+   * this one slot loses `sessionId`. H23 pins the assertion to the
+   * `sidebar.right.pane.tab` entry itself: the anchor is that slot's own `key:`
+   * line, and the window ends at the entry's next closing line.
    */
   {
     id: 'H23',
@@ -320,19 +336,26 @@ if (optedOut) {
         assert.fail(`${assertion.id} FAIL unknown kind ${assertion.kind}`)
       }
     }
-    console.log(`host-shape: verified ${ASSERTIONS.length} assertions at ${root} (22 frozen + H23 anchored)`)
+    console.log(`host-shape: verified ${ASSERTIONS.length} assertions at ${root} (21 frozen + H22 + H23 anchored)`)
   })
 
-  test('host shape: the list itself is the frozen one, plus the anchored addition', () => {
+  test('host shape: the list itself is the frozen one minus the tautology, plus the anchor', () => {
     // A fence that silently loses entries verifies nothing, so its own size is
-    // asserted too: the 22 frozen entries, plus H23 (ruling 7 / F5), which
-    // does not replace or reword any of them.
-    assert.equal(ASSERTIONS.length, 23)
-    assert.equal(new Set(ASSERTIONS.map((entry) => entry.id)).size, 23)
+    // asserted here. It is 22, not 23: H1-H22 are the frozen list with H21
+    // REMOVED (it was a tautology; see the note where it used to sit), and H23
+    // is the anchored replacement. The list is spelled out by id rather than by
+    // length alone, so dropping or reordering an entry fails on the id.
+    const expectedIds = ['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'H7', 'H8', 'H9', 'H10', 'H11', 'H12', 'H13', 'H14', 'H15', 'H16', 'H17', 'H18', 'H19', 'H20', 'H22', 'H23']
+    assert.deepEqual(ASSERTIONS.map((entry) => entry.id), expectedIds)
+    assert.equal(ASSERTIONS.length, 22)
+    assert.equal(new Set(ASSERTIONS.map((entry) => entry.id)).size, 22)
+    // H21 is gone on purpose, and nothing may quietly bring it back.
+    assert.equal(ASSERTIONS.some((entry) => entry.id === 'H21'), false, 'H21 is a tautology and must not return')
+    // H1-H20 keep their frozen order and spelling.
     assert.deepEqual(
-      ASSERTIONS.slice(0, 22).map((entry) => entry.id),
-      Array.from({ length: 22 }, (_, index) => `H${index + 1}`),
-      'the frozen 22 must stay in order and unchanged',
+      ASSERTIONS.slice(0, 20).map((entry) => entry.id),
+      Array.from({ length: 20 }, (_, index) => `H${index + 1}`),
+      'the frozen H1-H20 must stay in order and unchanged',
     )
     for (const entry of ASSERTIONS) {
       assert.equal(typeof entry.file, 'string')
@@ -343,14 +366,15 @@ if (optedOut) {
     }
   })
 
-  test('host shape: H21 alone cannot discriminate, and H23 can', async () => {
-    // The reason H23 exists, measured rather than asserted from memory: the
-    // runner bundle holds H21's substring many times over, but exactly once
-    // inside the sidebar.right.pane.tab entry.
+  test('host shape: an unanchored check on this substring cannot discriminate, and H23 can', async () => {
+    // Why H21 was removed rather than kept, measured rather than asserted from
+    // memory: the runner bundle holds the substring many times over, but
+    // exactly once inside the sidebar.right.pane.tab entry. If this ratio ever
+    // becomes 1, the anchored form loses its point and this test says so.
     const file = 'node_modules/@deepseek-ai/dsh-cordis-client-runner/lib/client.js'
     const text = await readFile(join(root, file), 'utf8')
     const total = occurrences(text, '"sessionId: SessionId"')
-    assert.ok(total > 1, `H21 is not discriminating when the string occurs ${total} times`)
+    assert.ok(total > 1, `an unanchored check would not discriminate when the string occurs ${total} times`)
     const window = blockWindow(text, 'key: "sidebar.right.pane.tab",')
     assert.ok(window !== null, 'the sidebar.right.pane.tab entry must exist')
     assert.equal(occurrences(window.text, '"sessionId: SessionId"'), 1)

@@ -31,6 +31,20 @@ jobs:
       - name: Manifest sanity
         run: node -e "const p=require('./package.json'); if(!p.dsh?.bundle?.patch||!p.dsh?.client) { throw new Error('dsh manifest incomplete') }; console.log(p.name, p.version)"
 
+      - name: Frozen-clock gate
+        # The release gate the README names and CI never ran: with Date.now()
+        # pinned, the suite must produce the same results as a normal run, which
+        # is the evidence that the jump budget counts pages / stalls / frames
+        # instead of wall time. `--no-warnings` keeps Node 20's Experimental
+        # warning about `--import` out of the log without hiding a failure.
+        #
+        # No host path argument and no DSH_ANNOTATE_HOST_ROOT here: the frozen
+        # run is about the browser half, and the host-shape fence is covered by
+        # its own jobs below.
+        env:
+          DSH_ANNOTATE_HOST_ROOT: absent
+        run: node --no-warnings --import ./test/freeze-clock.mjs --test
+
       - name: Render-harness dependencies
         # The crash this fence exists for (React #310, "Rendered more hooks than
         # during the previous render") is invisible to any source-only
@@ -48,14 +62,14 @@ jobs:
         # discovers `test/**` on every version in the matrix.
         #
         # DSH_ANNOTATE_HOST_ROOT=absent is the ONE explicit opt-out for the host
-        # shape fence (test/host-shape.test.mjs). A GitHub runner has no DSH
-        # installation, so the fence cannot be verified here; the variable says
-        # so out loud and the suite prints
+        # shape fence (test/host-shape.test.mjs). This job deliberately has no
+        # DSH installation, so the fence cannot be verified here; the variable
+        # says so out loud and the suite prints
         #   host shape check: skipped by DSH_ANNOTATE_HOST_ROOT=absent
         # into this log. Without the variable a missing host root is a FAILURE,
         # never a silent pass — the fence must not disappear because the host
-        # moved. Release evidence therefore includes a local strict run with the
-        # host present (22/22 assertions, exit 0).
+        # moved. The `host-shape` job below is where the same 22 assertions are
+        # actually run, against a real published host.
         env:
           DSH_ANNOTATE_HOST_ROOT: absent
         run: |
@@ -92,3 +106,156 @@ jobs:
             echo "::error::the render fence produced no verification line"
             exit 1
           fi
+
+  # ---------------------------------------------------------------------------
+  # The host-shape fence, actually RUN.
+  #
+  # `DSH_ANNOTATE_HOST_ROOT=absent` above means the 22 string assertions never
+  # execute in CI: the fence is only as strong as the machine that remembers to
+  # run it by hand. This job installs the published host and points the fence at
+  # it, so a rename, a moved file or a slot that lost a prop turns the build red
+  # on its own.
+  #
+  # Two things are easy to get wrong here, both measured:
+  #
+  #   1. DSH_ANNOTATE_HOST_ROOT MUST be the npm INSTALL PREFIX, not the package
+  #      directory. Every assertion's `file` already starts with
+  #      `node_modules/@deepseek-ai/`, and npm hoists the sibling packages to
+  #      `<prefix>/node_modules/@deepseek-ai/`; pointing at
+  #      `.../node_modules/@deepseek-ai/dsh` re-prefixes that path and H1 fails
+  #      with ENOENT. `--prefix` is what makes the tree land where the fence
+  #      looks.
+  #   2. The version is PINNED, not `@latest`. A shape fence that follows the
+  #      channel turns red on the day upstream publishes, whether or not
+  #      anything drifted, and a red build nobody can act on is a red build
+  #      people learn to ignore. The `host-shape-advisory` job below watches the
+  #      channels instead, without blocking.
+  #
+  # --cache is explicit because the default npm cache is read-only in some
+  # sandboxes (EROFS on `_cacache/tmp`), which fails the install for a reason
+  # that has nothing to do with the host.
+  # ---------------------------------------------------------------------------
+  host-shape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install the pinned host into an install prefix
+        env:
+          HOST_PREFIX: ${{ runner.temp }}/dsh-host
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-package-lock --no-audit --no-fund \
+            --prefix "$HOST_PREFIX" \
+            --cache "$HOST_PREFIX/.npm-cache" \
+            @deepseek-ai/dsh@0.2.0-rc.2
+          # The tree has to land where the assertions look, so prove it here
+          # rather than letting the fence report a missing file.
+          test -f "$HOST_PREFIX/node_modules/@deepseek-ai/dsh-cordis-client-runner/lib/client.js"
+          node -e "console.log('installed host', require('$HOST_PREFIX/node_modules/@deepseek-ai/dsh/package.json').version)"
+
+      - name: Host shape fence against the published host
+        env:
+          DSH_ANNOTATE_HOST_ROOT: ${{ runner.temp }}/dsh-host
+        run: |
+          set -o pipefail
+          node --test test/host-shape.test.mjs 2>&1 | tee host-shape-output.txt
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            tail -n 80 host-shape-output.txt | sed ':a;N;$!ba;s/\n/%0A/g' | sed 's/^/::error::Host shape fence failed:%0A/'
+          fi
+          exit "$status"
+
+      - name: The fence must say it verified, not that it skipped
+        # A green job that only printed the skip line would be the exact failure
+        # this job exists to end, so the verification line is a required output.
+        run: |
+          set -euo pipefail
+          if grep -qF 'skipped by DSH_ANNOTATE_HOST_ROOT=absent' host-shape-output.txt; then
+            echo "::error::the host shape fence skipped in the job that installs a host"
+            exit 1
+          fi
+          grep -F 'host-shape: verified' host-shape-output.txt
+
+      - name: Host contract drive against the published host
+        # The behavioural drive's ONE row that reads the real host — upstream's
+        # own `loadOlder()` and the publish calls inside it — runs here, in the
+        # job that has an installation to read. A single FILE argument, never a
+        # directory: Node 22 resolves a positional directory as a module path.
+        #
+        # This row reports a missing host as a FAILURE (only an explicit
+        # DSH_ANNOTATE_HOST_ROOT=absent skips), so the guard below is checking
+        # that a run which should have verified did verify — not rescuing a
+        # silent skip.
+        env:
+          DSH_ANNOTATE_HOST_ROOT: ${{ runner.temp }}/dsh-host
+        run: |
+          set -o pipefail
+          node --test test/host-contract.test.mjs 2>&1 | tee host-contract-output.txt
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            tail -n 80 host-contract-output.txt | sed ':a;N;$!ba;s/\n/%0A/g' | sed 's/^/::error::Host contract drive failed:%0A/'
+          fi
+          exit "$status"
+
+      - name: The contract drive must say it read the real host
+        # Same rule as the shape fence: a run that never reached the row is not
+        # evidence, so the verification line is required and the opt-out line is
+        # refused.
+        run: |
+          set -euo pipefail
+          if grep -qF 'skipped by DSH_ANNOTATE_HOST_ROOT=absent' host-contract-output.txt; then
+            echo "::error::the host contract drive skipped in the job that installs a host"
+            exit 1
+          fi
+          grep -F 'host-contract: verified the real host' host-contract-output.txt
+
+  # ---------------------------------------------------------------------------
+  # The channel watch: advisory only.
+  #
+  # The pinned job above is the gate. This one answers a different question —
+  # "has upstream moved past the shape we froze?" — and it must never block a
+  # merge, because a newer prerelease is not automatically a breakage. It runs
+  # on `@alpha` because that is where the next shape lands first: measured on
+  # this repository, `0.2.1-alpha.2` still satisfies the frozen assertions, so
+  # this job is expected to pass; the day it starts failing is the day to look.
+  # ---------------------------------------------------------------------------
+  host-shape-advisory:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install the newest alpha host into an install prefix
+        env:
+          HOST_PREFIX: ${{ runner.temp }}/dsh-host-alpha
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-package-lock --no-audit --no-fund \
+            --prefix "$HOST_PREFIX" \
+            --cache "$HOST_PREFIX/.npm-cache" \
+            @deepseek-ai/dsh@alpha
+          test -f "$HOST_PREFIX/node_modules/@deepseek-ai/dsh-cordis-client-runner/lib/client.js"
+          node -e "console.log('installed alpha host', require('$HOST_PREFIX/node_modules/@deepseek-ai/dsh/package.json').version)"
+
+      - name: Host shape fence against the alpha channel (advisory)
+        env:
+          DSH_ANNOTATE_HOST_ROOT: ${{ runner.temp }}/dsh-host-alpha
+        run: |
+          set -o pipefail
+          node --test test/host-shape.test.mjs 2>&1 | tee host-shape-alpha-output.txt
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::the alpha host no longer satisfies the frozen host shape; this is advisory, not a gate"
+            tail -n 60 host-shape-alpha-output.txt | sed ':a;N;$!ba;s/\n/%0A/g' | sed 's/^/::warning::Alpha host shape drift:%0A/'
+          fi
+          exit "$status"
+
