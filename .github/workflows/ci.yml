@@ -31,6 +31,22 @@ jobs:
       - name: Manifest sanity
         run: node -e "const p=require('./package.json'); if(!p.dsh?.bundle?.patch||!p.dsh?.client) { throw new Error('dsh manifest incomplete') }; console.log(p.name, p.version)"
 
+      - name: Render-harness dependencies
+        # The crash this fence exists for (React #310, "Rendered more hooks than
+        # during the previous render") is invisible to any source-only
+        # assertion: it needs a real renderer. These three are installed with
+        # --no-save/--no-package-lock on purpose — the plugin keeps its
+        # zero-dependency manifest, the host profile never receives them, and
+        # they exist only in this runner's node_modules. The versions match what
+        # the DSH web profile serves (react 18.3.1).
+        #
+        # Installed BEFORE the frozen-clock gate, never after it: that gate runs
+        # the whole suite, and test/popover-render.test.mjs treats a missing
+        # harness as a FAILURE, not a skip. With this step below the gate,
+        # run #19 went red on Node 20 and 22 with that one failure and never
+        # reached the steps that publish the log evidence.
+        run: npm install --no-save --no-package-lock --no-audit --no-fund react@18.3.1 react-dom@18.3.1 jsdom@24
+
       - name: Frozen-clock gate
         # The release gate the README names and CI never ran: with Date.now()
         # pinned, the suite must produce the same results as a normal run, which
@@ -44,16 +60,6 @@ jobs:
         env:
           DSH_ANNOTATE_HOST_ROOT: absent
         run: node --no-warnings --import ./test/freeze-clock.mjs --test
-
-      - name: Render-harness dependencies
-        # The crash this fence exists for (React #310, "Rendered more hooks than
-        # during the previous render") is invisible to any source-only
-        # assertion: it needs a real renderer. These three are installed with
-        # --no-save/--no-package-lock on purpose — the plugin keeps its
-        # zero-dependency manifest, the host profile never receives them, and
-        # they exist only in this runner's node_modules. The versions match what
-        # the DSH web profile serves (react 18.3.1).
-        run: npm install --no-save --no-package-lock --no-audit --no-fund react@18.3.1 react-dom@18.3.1 jsdom@24
 
       - name: Host-half tests
         # No path argument on purpose. Node 22 resolves a positional argument as
