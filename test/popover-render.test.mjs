@@ -51,7 +51,7 @@ import { createRequire } from 'node:module'
 const source = await readFile(new URL('../client.js', import.meta.url), 'utf8')
 
 /** The frozen probe return: the only bytes of the factory body this suite replaces. */
-const SHIPPING_RETURN = "    return { inject: ['slots', 'locale'], apply: apply, core: coreExports }"
+const SHIPPING_RETURN = "    return { inject: ['slots', 'locale'], apply: apply, core: coreExports, hostFace: testSeam }"
 const PROBE_RETURN = [
   '    return {',
   '      apply: apply,',

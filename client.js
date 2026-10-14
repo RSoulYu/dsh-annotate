@@ -2802,11 +2802,13 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
-      // Test seam, and an explicitly given one: the suite that drives the real
-      // jump against a behavioural host double has to reach the very functions
-      // that read the host face. Republished here rather than copied into the
-      // test, so a copy cannot drift away from what ships. It is a local
-      // variable, never a package export, and it changes nothing the hook does.
+      // The seam is filled here and handed out on the object the factory
+      // returns — never on `ctx`. A client runtime fiber rejects
+      // `ctx.hostFace = …` with `cannot set property "hostFace" without
+      // provide`, and a throw inside `apply` fails the entry, which fails the
+      // whole web boot ("Failed to load plugins"). The module object is what
+      // the loader seats and what the drive already holds, and no service
+      // registry ever sees it.
       testSeam.frameSchedule = function (callback) {
         // The seam's scheduler is the plugin's own: it goes through the same
         // `runtime.frameScheduler` / requestAnimationFrame / setTimeout ladder
@@ -2817,7 +2819,6 @@ window.__ModuleLoader__.load({
       testSeam.frameHook = function (hook) {
         runtime.frameScheduler = hook
       }
-      ctx.hostFace = testSeam
 
       ctx.effect(function () {
         var disposeZh = ctx.locale.register('dsh-annotate', 'zh', ZH)
@@ -2989,6 +2990,6 @@ window.__ModuleLoader__.load({
       })
     }
 
-    return { inject: ['slots', 'locale'], apply: apply, core: coreExports }
+    return { inject: ['slots', 'locale'], apply: apply, core: coreExports, hostFace: testSeam }
   },
 })

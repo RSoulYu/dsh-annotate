@@ -179,9 +179,13 @@ test('the host-face seam is exactly the frozen set, granted in exactly one place
   assert.deepEqual(declaredExports(source, 'client.js'), HOST_FACE_FROZEN, 'the seam must be the frozen set, in order')
   assert.deepEqual(declaredFaceCeiling(source, 'client.js'), HOST_FACE_FROZEN, 'the @pure-anchor-face ceiling must match')
 
-  // The publication point: the seam is handed out on the hook's own context
-  // object, which is the one thing the host passes to `apply`.
-  assert.ok(source.includes('ctx.hostFace = testSeam'), 'apply() must publish the seam on ctx')
+  // The publication point: the seam rides the module object the loader seats,
+  // which is what the host hands to cordis — NOT `ctx`. A client runtime fiber
+  // rejects `ctx.hostFace = …` with "cannot set property \"hostFace\" without
+  // provide", and that throw inside `apply` fails the entry and the whole web
+  // boot; the module object carries it with no service registry involved.
+  assert.ok(source.includes('hostFace: testSeam }'), 'the factory must publish the seam on its module object')
+  assert.equal(/^\s*ctx\.hostFace\s*=/m.test(source), false, 'the seam must never be assigned onto ctx')
 
   // A hand-out, not an export: the bundle must gain no `export` statement (it
   // is a ModuleLoader bundle, not a module), and the published `coreExports`
@@ -208,11 +212,30 @@ test('the host-face seam is exactly the frozen set, granted in exactly one place
   }
 })
 
+test('the client half never assigns a property onto ctx', () => {
+  // The platform rule this fence encodes, measured rather than assumed: a client
+  // runtime fiber refuses `ctx.<name> = value` for any name that was not
+  // `provide`d — the throw reads
+  //   cannot set property "hostFace" without provide
+  // and it happens inside `apply`, which fails the entry, which aborts the
+  // whole web boot ("Failed to load plugins: dsh-annotate"). 0.10.5 shipped
+  // exactly that line and the page never mounted again; every test in this
+  // repository stayed green, because this suite hands `apply` a plain object
+  // and a plain object accepts any assignment. Services are registered with
+  // `ctx.provide`; everything else a plugin needs stays local or rides the
+  // module object the factory returns.
+  const offenders = []
+  source.split('\n').forEach((line, index) => {
+    if (/^\s*ctx\.[A-Za-z_$][A-Za-z0-9_$]*\s*=[^=]/.test(line)) offenders.push(`client.js:${String(index + 1)}: ${line.trim()}`)
+  })
+  assert.deepEqual(offenders, [], 'assigning a non-service property onto ctx fails the web boot')
+})
+
 /* --------------------------------------------- the browser declarations */
 
 const CORE_HEAD = '    /* @pure-anchor\n     *\n     * Jump-to-source core.\n'
 const CORE_TAIL = '/* @pure-anchor-end */'
-const SHIPPING_RETURN = "    return { inject: ['slots', 'locale'], apply: apply, core: coreExports }"
+const SHIPPING_RETURN = "    return { inject: ['slots', 'locale'], apply: apply, core: coreExports, hostFace: testSeam }"
 const PROBE_RETURN = [
   '    return {',
   '      hostFace: testSeam,',
@@ -260,7 +283,7 @@ function loadBrowserHalf(text, label, services = {}) {
   assert.notEqual(at, -1, `${label}: the shipping return is gone`)
   assert.equal(text.indexOf(SHIPPING_RETURN, at + 1), -1, `${label}: the shipping return is duplicated`)
   const probe = text.slice(0, at) + PROBE_RETURN + text.slice(at + SHIPPING_RETURN.length)
-  assert.ok(probe.includes('ctx.hostFace = testSeam'), `${label}: the probe bundle must publish the seam`)
+  assert.ok(probe.includes('hostFace: testSeam'), `${label}: the probe bundle must publish the seam`)
 
   let captured = null
   new Function('window', probe)({ __ModuleLoader__: { load: (definition) => { captured = definition } } })
@@ -303,9 +326,9 @@ function loadBrowserHalf(text, label, services = {}) {
     slots: { inject: () => () => {}, register: () => () => {} },
   }
   module.apply(ctx)
-  assert.ok(ctx.hostFace !== undefined && ctx.hostFace !== null, `${label}: apply must publish the host face on ctx`)
-  assert.notEqual(ctx.hostFace.frameSchedule, null, `${label}: apply must hand over the real frame scheduler`)
-  return { module, hostFace: ctx.hostFace, live, services }
+  assert.ok(module.hostFace !== undefined && module.hostFace !== null, `${label}: the module must publish the host face`)
+  assert.notEqual(module.hostFace.frameSchedule, null, `${label}: apply must hand over the real frame scheduler`)
+  return { module, hostFace: module.hostFace, live, services }
 }
 
 /* ------------------------------------------------- the behavioural host */

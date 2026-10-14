@@ -4,6 +4,36 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.6] - 2026-10-14
+
+### Fixed
+
+- **The web UI would not open at all.** 0.10.5 shipped the browser half with
+  `ctx.hostFace = testSeam` inside the shipping `apply()`. A client runtime
+  fiber refuses that assignment — `cannot set property "hostFace" without
+  provide` — so `apply` threw, the loader's entry went `FAILED`, and the boot
+  aborted with `Failed to load plugins: dsh-annotate`. The page never reached
+  the application: a reload of `dsh web` showed the boot card and nothing else,
+  and restoring the working tree to the 0.10.1 bundle was the only thing that
+  brought it back. Measured end to end in a real browser (headless Chromium
+  against a scratch `DSH_HOME` whose plugin link pointed at the 0.10.5 tree):
+  the boot fails on 0.10.5, deleting that one line restores it, and this release
+  restores it with the seam moved.
+
+  The seam now rides the object the factory returns — the module the loader
+  seats, which the drive already holds — instead of the context. Its contents
+  are unchanged, and no service is registered.
+
+### Tests
+
+- Two assertions in `test/host-contract.test.mjs` keep the rule the outage went
+  around: the factory's module object must publish the seam, and the client half
+  must never assign a property onto `ctx` at all. The suite's `ctx` is a plain
+  object, which accepts any assignment — that is exactly why every test in this
+  repository stayed green through the outage — so the fence is a source
+  assertion, not a drive. Re-adding the removed line fails both (mutation
+  control).
+
 ## [0.10.5] - 2026-10-14
 
 ### Fixed
@@ -317,6 +347,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The repository suite is 150/150 locally (host shape fence included, DSH host
   present), stable over repeated runs.
 
+[0.10.6]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.5...v0.10.6
 [0.10.5]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.4...v0.10.5
 [0.10.4]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/RSoulYu/dsh-annotate/compare/v0.10.2...v0.10.3
